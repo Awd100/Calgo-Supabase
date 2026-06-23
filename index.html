@@ -1434,11 +1434,11 @@ async function loadUserFromSession(authUser) {
         // currentUser is confirmed set — safe to add friend now
         addFriend(visitedUser);
         renderCalendar();
-    } else if (!$('loginScreen').classList.contains('hidden')) {
-        enterApp();
-        syncCurrentUserData();
     } else {
-        hideLoadingOverlay();
+        // Always enter the app for a normal (non-public) session. Previously this only
+        // ran when the login screen was still visible, so an OAuth-redirect return (or a
+        // remembered-session restore) left a blank screen — neither login nor app shown. (Inc 4 live test)
+        enterApp();
         syncCurrentUserData();
     }
 }
