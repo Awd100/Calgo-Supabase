@@ -3008,19 +3008,27 @@ async function openPrintSaveModal() {
     try {
         await ensureHtml2CanvasLoaded();
         previewBox.innerHTML = '<div class="preview-loading">⏳ Generating preview…</div>';
-        const cleanEl = buildCleanCalendarElementForExport();
-        document.body.appendChild(cleanEl);
 
-        const canvas = await html2canvas(cleanEl, {
-            scale:            2,             // Retina quality
-            useCORS:          true,
-            backgroundColor:  '#ffffff',
-            logging:          false,
-            width:            cleanEl.offsetWidth,
-            height:           cleanEl.offsetHeight
-        });
-
-        document.body.removeChild(cleanEl);
+        // Capture the clean LIGHT sheet even when night mode is on — dark prints waste ink
+        // and read poorly on paper. Night mode is restored right after. (2.4 night-mode fix)
+        const wasDark = (typeof DarkReader !== 'undefined') && DarkReader.isEnabled();
+        if (wasDark) DarkReader.disable();
+        let canvas, cleanEl = null;
+        try {
+            cleanEl = buildCleanCalendarElementForExport();
+            document.body.appendChild(cleanEl);
+            canvas = await html2canvas(cleanEl, {
+                scale:            2,             // Retina quality
+                useCORS:          true,
+                backgroundColor:  '#ffffff',
+                logging:          false,
+                width:            cleanEl.offsetWidth,
+                height:           cleanEl.offsetHeight
+            });
+        } finally {
+            if (cleanEl && cleanEl.parentNode) cleanEl.parentNode.removeChild(cleanEl);
+            if (wasDark) DarkReader.enable(NIGHT_MODE_THEME);
+        }
         printSaveCanvasEl = canvas;
 
         // Show preview thumbnail
