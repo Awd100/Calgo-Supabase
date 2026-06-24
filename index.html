@@ -16,6 +16,16 @@
         href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%236366f1'/><text x='50' y='68' text-anchor='middle' font-size='50'>📅</text></svg>">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <!-- Night mode via Dark Reader: dynamically themes the whole app, incl. hardcoded colors + images -->
+    <script src="https://cdn.jsdelivr.net/npm/darkreader@4/darkreader.min.js"></script>
+    <script>
+      // Apply the saved (or system) night-mode preference before first paint to avoid a flash of light.
+      try {
+        var __nm = localStorage.getItem('fc_night_mode');
+        var __wantDark = (__nm === 'true') || (__nm === null && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (__wantDark && window.DarkReader) DarkReader.enable({ brightness: 100, contrast: 90, sepia: 0 });
+      } catch (e) {}
+    </script>
     <style>
         /* ── CSS CUSTOM PROPERTIES ── */
         :root {
@@ -608,6 +618,7 @@
                 <div class="dropdown-item" onclick="event.stopPropagation();showTab('profile')">👤 My Profile &amp; Friends</div>
                 <div class="dropdown-item" onclick="event.stopPropagation();showTab('calendar')">📅 Calendar</div>
                 <div class="dropdown-item" onclick="event.stopPropagation();showTab('bookings')">📋 Bookings</div>
+                <div class="dropdown-item" id="nightModeToggle" onclick="event.stopPropagation();toggleNightMode()">🌙 Night Mode</div>
                 <div class="dropdown-separator"></div>
                 <div class="dropdown-item danger" onclick="event.stopPropagation();logout()">🚪 Log Out</div>
             </div>
@@ -1738,6 +1749,47 @@ function logout() {
 /* ══════════════════════════════════════
    NAVIGATION
 ══════════════════════════════════════ */
+
+/* ══════════════════════════════════════
+   FEATURE: NIGHT MODE (Dark Reader)
+   One toggle dynamically themes the entire app — including the many
+   hardcoded colors and images — via the Dark Reader engine. The choice
+   persists locally and defaults to the OS color scheme on first run.
+══════════════════════════════════════ */
+
+const NIGHT_MODE_KEY   = 'night_mode';
+const NIGHT_MODE_THEME = { brightness: 100, contrast: 90, sepia: 0 };
+
+/** True if night mode is on (saved choice, or the OS setting when never chosen). */
+function isNightModeOn() {
+    const saved = Storage.getRaw(NIGHT_MODE_KEY);
+    if (saved === true || saved === false) return saved;
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+/** Enable/disable the Dark Reader theme and refresh the menu toggle label. */
+function applyNightMode(on) {
+    try {
+        if (typeof DarkReader !== 'undefined') {
+            if (on) DarkReader.enable(NIGHT_MODE_THEME); else DarkReader.disable();
+        }
+    } catch (e) { console.warn('Night mode error:', e.message); }
+    const item = $('nightModeToggle');
+    if (item) item.textContent = on ? '☀️ Light Mode' : '🌙 Night Mode';
+}
+
+/** Flip night mode, persist the choice, and apply it. */
+function toggleNightMode() {
+    const next = !isNightModeOn();
+    Storage.setRaw(NIGHT_MODE_KEY, next);
+    applyNightMode(next);
+    showToast(next ? '🌙 Night mode on' : '☀️ Light mode on');
+}
+
+/** Apply the saved/system preference on load and sync the toggle label. */
+function loadNightModePreference() {
+    applyNightMode(isNightModeOn());
+}
 
 function toggleProfileMenu(event) {
     event.stopPropagation();
@@ -5389,6 +5441,7 @@ function addInvitationToCalgo(encodedTitle, dateStr, startTime, endTime) {
 }
 
 init();
+loadNightModePreference();
 </script>
 </body>
 </html>
