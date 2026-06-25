@@ -4415,6 +4415,7 @@ function sendSingleInviteViaWhatsApp() {
     const note  = $('singleInviteNote').value.trim();
     if (!phone || !date || !start || !end) { showToast('❌ Fill all fields'); return; }
     if (start >= end) { showToast('❌ End after start'); return; }
+    const pastErr = pastDateTimeError(date, start); if (pastErr) { showToast(pastErr); return; }
     window.open(`https://wa.me/${cc + phone}?text=${encodeURIComponent(buildInviteMessage(date, start, end, note, singleInviteRecipientName))}`, '_blank');
     logRecentContact(cc + phone, singleInviteRecipientName || '', 'invited');
     showToast('📨 Opening WhatsApp…');
@@ -4499,6 +4500,7 @@ function sendGroupInviteToOne(phone) {
     const date    = $('groupInviteDate').value, start = $('groupInviteStart').value, end = $('groupInviteEnd').value, note = $('groupInviteNote').value.trim();
     if (!date || !start || !end) { showToast('❌ Fill date/time first'); return; }
     if (start >= end)            { showToast('❌ End after start'); return; }
+    const pastErr = pastDateTimeError(date, start); if (pastErr) { showToast(pastErr); return; }
     const contact       = groupContactList.find(c => c.phone === phone);
     const recipientName = contact?.name || null;
     window.open(`https://wa.me/${phone}?text=${encodeURIComponent(buildInviteMessage(date, start, end, note, recipientName))}`, '_blank');
@@ -4512,6 +4514,7 @@ function sendGroupInviteToAll() {
     const date = $('groupInviteDate').value, start = $('groupInviteStart').value, end = $('groupInviteEnd').value, note = $('groupInviteNote').value.trim();
     if (!date || !start || !end) { showToast('❌ Fill date/time first'); return; }
     if (start >= end)            { showToast('❌ End after start'); return; }
+    const pastErr = pastDateTimeError(date, start); if (pastErr) { showToast(pastErr); return; }
     const unsent = groupContactList.filter(c => !c.sent);
     if (!unsent.length) { showToast('✅ All already sent!'); return; }
     unsent.forEach((c, i) => setTimeout(() => {
@@ -4711,6 +4714,17 @@ function isHourInPast(dateStr, hour) {
 /** Returns true if a whole calendar day is entirely in the past */
 function isDayFullyInPast(dateStr) {
     return isDateInPast(dateStr);
+}
+
+/**
+ * Returns a toast message if the given date/start time is in the past, else null.
+ * Mirrors the guard in submitBooking — used by the invite flows so you can't
+ * invite someone to a slot that has already passed.
+ */
+function pastDateTimeError(date, start) {
+    if (isDateInPast(date)) return '⏳ Cannot pick a date in the past';
+    if (isDateToday(date) && start < buildCurrentTimeString()) return '⏳ Cannot pick a time that has already passed';
+    return null;
 }
 
 
