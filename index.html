@@ -6,6 +6,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Discourage caching a stale build of the app HTML (the service worker below is the real fix). -->
+    <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
     <title>Calgo - Let's Go!</title>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#6366f1">
@@ -283,15 +285,6 @@
         .friend-btn-rename { background: #f1f5f9; color: var(--text-light); }
         .friend-btn-remove { background: #fee2e2; color: var(--danger); }
         .no-friends-message { color: var(--text-light); font-size: 13px; text-align: center; padding: 14px; background: #f8fafc; border-radius: 14px; border: 2px dashed var(--border); }
-        /* ── COMPARE MODE: my calendar shown read-only above a friend's bookable one ── */
-        #compareMyCard { border: 2px solid var(--border); }
-        #compareMyCard .compare-cal { pointer-events: none; opacity: 0.95; }  /* reference only — not interactive */
-        #compareMyCard .slot-tag-input, #compareMyCard .slot-action { display: none; }  /* strip edit/book affordances */
-        .compare-my-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-        .compare-avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--primary); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; overflow: hidden; flex-shrink: 0; }
-        .compare-avatar img { width: 100%; height: 100%; object-fit: cover; }
-        .compare-my-name { font-weight: 700; font-size: 14px; }
-        .compare-my-tag { font-size: 10px; font-weight: 700; color: var(--text-light); background: #f1f5f9; border-radius: 6px; padding: 2px 7px; flex-shrink: 0; }
         /* ── RECENT CONTACTS ── */
         .recent-contacts-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
         .recent-contacts-title  { font-size: 13px; font-weight: 700; color: var(--text-light); display: flex; align-items: center; gap: 6px; }
@@ -769,6 +762,7 @@
                 <button onclick="setCalendarView('day')"   id="view-day">📆 Day</button>
                 <button onclick="setCalendarView('week')"  id="view-week">🗓 Week</button>
                 <button onclick="setCalendarView('month')" id="view-month" class="active">📅 Month</button>
+                <button onclick="refreshFromCloud()" class="btn-print-save" title="Reload your data from the cloud">🔄 Refresh</button>
                 <button onclick="openPrintSaveModal()" class="btn-print-save">🖨️ Print/Save</button>
             </div>
             <div id="calView"></div>
@@ -795,19 +789,6 @@
      PUBLIC VIEW
 ══════════════════════════════════════ -->
 <div id="publicView" class="app hidden">
-    <!-- Compare mode only (opened from a friend's 📅): MY calendar on top, read-only,
-         kept in sync with the friend's view below so I can spot a mutually-free slot. -->
-    <div id="compareMyCard" class="card hidden" style="margin-bottom:14px;">
-        <div class="compare-my-header">
-            <span class="compare-avatar" id="compareMyAvatar">👤</span>
-            <div style="flex:1;min-width:0;">
-                <div class="compare-my-name" id="compareMyName"></div>
-                <div class="cal-title" id="compareMyTitle" style="font-size:12px;color:var(--text-light);text-align:left;"></div>
-            </div>
-            <span class="compare-my-tag">for reference</span>
-        </div>
-        <div class="compare-cal" id="compareMyCal"></div>
-    </div>
     <div class="public-banner">
         <div class="public-avatar" id="publicUserAvatar">👤</div>
         <div>
@@ -837,7 +818,7 @@
         </div>
     </div>
     <div style="text-align:center;margin-top:18px;">
-        <button class="btn-primary" onclick="window.location.href=window.location.pathname" style="width:auto;padding:13px 30px;">📅 Get Your Own Calendar</button>
+        <button id="publicBottomBtn" class="btn-primary" onclick="window.location.href=window.location.pathname" style="width:auto;padding:13px 30px;">📅 Get Your Own Calendar</button>
     </div>
 </div>
 
@@ -1309,7 +1290,6 @@ const Storage = {
 ══════════════════════════════════════ */
 let currentUser         = null;   // Logged-in user object
 let visitedUser         = null;   // Profile being viewed publicly
-let compareReferenceUserId = null; // In compare mode: my id, drawn read-only atop the friend's bookable public view
 let currentView         = 'month';
 let currentDate         = new Date();
 let groupContactList    = [];
@@ -1667,8 +1647,9 @@ function deleteBlock(blockId) {
     if (isSupabaseReady) dbDeleteBlock(blockId);
 }
 
-async function syncCurrentUserData() {
+async function syncCurrentUserData(opts) {
     if (!currentUser || !isSupabaseReady) return;
+    const showToasts = opts && opts.manual;   // only chime for a user-triggered refresh
     try {
         // Fetch owned bookings, blocks, and friend list in parallel
         const [ownedBookings, ownedBlocks, friendList] = await Promise.all([
@@ -1684,10 +1665,26 @@ async function syncCurrentUserData() {
         mergeSupabaseBlocks(ownedBlocks);
         await mergeFriendsFromSupabase(friendList);
         bumpCalendarDataVersion(); // Invalidate render cache after any data merge
-        if (currentView) renderCalendar();
-        if ($('bookingsTab') && !$('bookingsTab').classList.contains('hidden')) loadBookings();
-        if ($('profileTab')  && !$('profileTab').classList.contains('hidden'))  renderFriends();
-    } catch (e) { console.error('Sync error', e); }
+        // Re-render ALL data views (elements exist even when their tab is hidden), so
+        // navigating to Profile/Bookings always shows freshly-synced data without a manual
+        // refresh — this is the fix for "logged in but everything looks empty".
+        if (currentView && !visitedUser) renderCalendar();
+        if ($('bookingsTab')) loadBookings();
+        if ($('profileTab'))  renderFriends();
+        if (showToasts) showToast('✅ Up to date');
+    } catch (e) {
+        console.error('Sync error', e);
+        // Make a failed sync visible instead of silently showing an empty account.
+        showToast('⚠️ Couldn’t load your latest data — check your connection, then tap 🔄 Refresh.');
+    }
+}
+
+/** User-triggered cloud refresh (🔄). Surfaces success/failure via toasts. */
+function refreshFromCloud() {
+    if (!currentUser) return;
+    if (!isSupabaseReady) { showToast('⚠️ No cloud connection yet — try again in a moment.'); return; }
+    showToast('🔄 Refreshing…');
+    syncCurrentUserData({ manual: true });
 }
 
 function mergeSupabaseBookings(ownedBookings, outgoingBookings) {
@@ -1798,7 +1795,6 @@ function logout() {
     stopBookingReminderLoop();      // Stop reminder interval before clearing user state
     currentUser  = null;
     visitedUser  = null;
-    compareReferenceUserId = null;
     calendarLastRenderSignature = null;
     authSessionLoadedFor = null;
     clearRememberedSession();
@@ -2480,10 +2476,11 @@ function prefillSingleInviteFor(phone, name) {
     }
 }
 
-/** Open a friend's calendar on its own page (new tab): my calendar + theirs, read-only. */
+/** Open a friend's bookable calendar in the SAME page (no new tab). The public view
+ *  shows a "← Back to my calendar" button to return. */
 function openFriendCalendar(calgoId) {
     if (!calgoId) return;
-    window.open(getBaseUrl() + '?compare=' + encodeURIComponent(calgoId), '_blank');
+    window.location.href = buildShareUrl(calgoId);
 }
 
 let html5QrCode = null;
@@ -2875,7 +2872,8 @@ function enterPublicView(user) {
     calendarLastRenderSignature = null; // Always render fresh for a different user's calendar
 
     const savedSession = Storage.getCurrentUser();
-    if (savedSession && savedSession.id && savedSession.id !== user.id) {
+    const isLoggedInViewer = !!(savedSession && savedSession.id && savedSession.id !== user.id);
+    if (isLoggedInViewer) {
         const savedUserData = Storage.getUsers()[savedSession.id];
         if (savedUserData) { currentUser = savedUserData; addFriend(user); }
     }
@@ -2887,6 +2885,9 @@ function enterPublicView(user) {
     avatarEl.innerHTML = user.avatar
         ? `<img src="${escapeHtml(user.avatar)}">`
         : escapeHtml(user.name.charAt(0).toUpperCase());
+    // A logged-in viewer opened a friend's calendar → offer a clear way back to their app.
+    const bottomBtn = $('publicBottomBtn');
+    if (bottomBtn) bottomBtn.textContent = isLoggedInViewer ? '← Back to my calendar' : '📅 Get Your Own Calendar';
     renderCalendar();
 }
 
@@ -2962,9 +2963,6 @@ function renderCalendar() {
     if      (currentView === 'day')  renderDayView(viewEl, titleEl, userId, isPublic);
     else if (currentView === 'week') renderWeekView(viewEl, titleEl, userId, isPublic);
     else                             renderMonthView(viewEl, titleEl, userId, isPublic);
-
-    // Compare mode: keep my read-only reference calendar in sync with the friend's view.
-    renderCompareReference();
 }
 
 function selectDayFromMonthView(day) {
@@ -4764,7 +4762,6 @@ if (!isRunningInstalled() && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgen
 async function init() {
     const params      = new URLSearchParams(window.location.search);
     const targetUid   = params.get('user');
-    const compareUid  = params.get('compare');
     const isEventLink = params.get('event');
     const addToCalgo  = params.get('add_Calgo');
 
@@ -4777,11 +4774,6 @@ async function init() {
     }
 
     showLoadingOverlay('Loading Calgo…');
-
-    if (compareUid) {
-        await enterCompareView(compareUid);
-        return;
-    }
 
     if (targetUid) {
         await initWithTargetUser(targetUid);
@@ -4836,89 +4828,6 @@ async function initWithTargetUser(targetUid) {
     const saved = Storage.getCurrentUser();
     if (saved && saved.id === targetUid) { currentUser = user; enterApp(); syncCurrentUserData(); }
     else enterPublicView(user);
-}
-
-/**
- * Compare page opened from a friend's 📅 button. Shows the friend's FULLY BOOKABLE
- * public calendar (request → they confirm → it's added to your calendar, exactly as
- * before) with MY calendar rendered read-only on top as a reference, kept in sync with
- * the friend's current view/date so I can spot a slot we're both free. Falls back to the
- * normal public calendar if the viewer isn't logged in.
- * @param {string} friendId
- */
-async function enterCompareView(friendId) {
-    // Resolve "me" (cross-tab via saved session / storage).
-    let me = currentUser || Storage.getCurrentUser();
-    if (!me && supabaseClient) {
-        try {
-            const session = (await supabaseClient.auth.getSession()).data.session;
-            if (session && session.user) {
-                me = Storage.getUsers()[session.user.id] || await dbGetUser(session.user.id) || buildUserFromSupabase(session.user);
-            }
-        } catch (e) {}
-    }
-    if (!me || me.id === friendId) {
-        // Not logged in (or your own link) → plain public calendar, no reference.
-        await initWithTargetUser(friendId);
-        return;
-    }
-    currentUser = me;
-    Storage.setCurrentUser(me);
-
-    // Pull both calendars' data into local storage so isDayBusy/isHourBusy(date, ownerId) resolve.
-    let friend = Storage.getUsers()[friendId] || null;
-    if (isSupabaseReady) {
-        try {
-            const [f, myBlocks, myBookings, frBlocks, frBookings] = await Promise.all([
-                friend ? Promise.resolve(friend) : dbGetUser(friendId),
-                dbGetBlocksByOwner(me.id),
-                dbGetBookingsByOwner(me.id),
-                dbGetBlocksByOwner(friendId),
-                dbGetBookingsByOwner(friendId)
-            ]);
-            friend = f || friend;
-            const blMap = {}; Storage.getBlocks().forEach(b => blMap[b.id] = b);
-            myBlocks.concat(frBlocks).forEach(b => blMap[b.id] = b); Storage.setBlocks(Object.values(blMap));
-            const bMap = {}; Storage.getBookings().forEach(b => bMap[b.id] = b);
-            myBookings.concat(frBookings).forEach(b => bMap[b.id] = b); Storage.setBookings(Object.values(bMap));
-            if (friend) { const us = Storage.getUsers(); us[friendId] = friend; Storage.setUsers(us); }
-        } catch (e) { console.error('compare load error:', e); }
-    }
-    if (!friend) {
-        hideLoadingOverlay();
-        showToast('❌ Could not load that calendar');
-        window.location.href = getBaseUrl();
-        return;
-    }
-
-    // Turn on compare mode: renderCalendar() will also draw my read-only calendar on top.
-    compareReferenceUserId = me.id;
-    const myCard = $('compareMyCard');
-    if (myCard) myCard.classList.remove('hidden');
-    $('compareMyName').textContent = (me.name || 'My calendar') + ' (me)';
-    const myAvatar = $('compareMyAvatar');
-    if (myAvatar) {
-        if (me.avatar) myAvatar.innerHTML = `<img src="${escapeHtml(me.avatar)}">`;
-        else myAvatar.textContent = (me.name || '?').charAt(0).toUpperCase();
-    }
-    const subtitle = $('publicUserSubtitle');
-    if (subtitle) subtitle.textContent = 'Pick a slot you’re both free to book';
-
-    // Enter the real bookable public view for the friend (full request→confirm→add flow).
-    enterPublicView(friend);
-}
-
-/** In compare mode, draw MY own calendar (read-only) into the reference card, mirroring
- *  the friend's current view + date so the same time window lines up. Called by
- *  renderCalendar() after the friend's calendar renders. */
-function renderCompareReference() {
-    if (!compareReferenceUserId) return;
-    const cal   = $('compareMyCal');
-    const title = $('compareMyTitle');
-    if (!cal || !title) return;
-    if      (currentView === 'day')  renderDayView(cal, title, compareReferenceUserId, false);
-    else if (currentView === 'week') renderWeekView(cal, title, compareReferenceUserId, false);
-    else                             renderMonthView(cal, title, compareReferenceUserId, false);
 }
 
 function initFromSavedSession() {
@@ -5766,8 +5675,31 @@ function addInvitationToCalgo(encodedTitle, dateStr, startTime, endTime) {
     }
 }
 
+// Build stamp — log which deployed build is actually running (helps diagnose "stale
+// cache" reports: compare this to the latest deploy).
+const APP_BUILD = '2026-07-06a';
+console.log('[Calgo] build', APP_BUILD);
+
+// Network-first service worker: always fetch the latest build when online (fixes stale
+// cached versions), fall back to cache only when offline. Same-origin GETs only, so
+// Supabase/CDN requests pass straight through.
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW register failed', err));
+    });
+}
+
 init();
 loadNightModePreference();
+
+// Self-heal a stale view: when the app returns to the foreground (tab focus / PWA
+// resume) while logged into your own calendar, quietly re-pull from the cloud so data
+// that failed to load on first paint reappears without a manual refresh.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && currentUser && !visitedUser && isSupabaseReady) {
+        syncCurrentUserData();
+    }
+});
 </script>
 </body>
 </html>
