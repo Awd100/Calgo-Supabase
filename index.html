@@ -1524,6 +1524,27 @@ async function dbGetUser(userId) {
     } catch (e) { console.error('user fetch error:', e.message); return null; }
 }
 
+/**
+ * Find a Calgo user by phone number (users are public-readable). Used to resolve
+ * whether a contact/friend is on Calgo when they aren't in this device's local store
+ * (e.g. someone who booked you from another device). Matches on digits so stored
+ * "+" / spaces / country-code formatting don't cause misses.
+ */
+async function dbGetUserByPhone(phone) {
+    const digits = (phone || '').replace(/\D/g, '');
+    if (digits.length < 5) return null;
+    try {
+        // Fast path: exact digits match (guest & updated numbers are stored as clean digits).
+        let res = await supabaseClient.from('users').select('*').eq('phone', digits).limit(1);
+        if (res.data && res.data.length) return mapRowToUser(res.data[0]);
+        // Fallback: tolerate stored formatting by matching the last 8 digits, then re-verify.
+        const tail = digits.slice(-8);
+        res = await supabaseClient.from('users').select('*').like('phone', '%' + tail).limit(5);
+        const match = (res.data || []).find(r => (r.phone || '').replace(/\D/g, '').slice(-8) === tail);
+        return match ? mapRowToUser(match) : null;
+    } catch (e) { console.error('user-by-phone fetch error:', e.message); return null; }
+}
+
 /* ── Supabase data access: blocks (columns already match the JS keys) ── */
 async function dbUpsertBlock(block) {
     try { const { error } = await supabaseClient.from('blocks').upsert(block); if (error) throw error; }
@@ -1551,6 +1572,13 @@ function mapRowToBooking(r) {
 }
 async function dbUpsertBooking(booking) {
     const { error } = await supabaseClient.from('bookings').upsert(mapBookingToRow(booking));
+    if (error) throw error;
+}
+// Owner accept/reject is an UPDATE, not an upsert: the bookings INSERT policy requires
+// auth.uid() = booker_id, which the owner is NOT — so an upsert gets rejected by RLS and
+// the app wrongly falls back to "saved locally". .update() hits only the owner-update policy.
+async function dbUpdateBooking(booking) {
+    const { error } = await supabaseClient.from('bookings').update(mapBookingToRow(booking)).eq('id', booking.id);
     if (error) throw error;
 }
 async function dbDeleteBooking(bookingId) {
@@ -2258,9 +2286,62 @@ function getResolvedFriends() {
 }
 
 /**
+ * Background pass: for friends that have a phone but no calgoId, resolve their Calgo
+ * account from the cloud by phone and upgrade the entry in place. This is what stops a
+ * friend you added from a booking/contact (name+phone only, no local user record) from
+ * being stuck showing "No Calgo". Re-renders + persists only if something changed.
+ * Fire-and-forget; safe to call after any friends render.
+ */
+let _friendsCloudUpgradeRunning = false;
+const _triedCalgoLookupPhones   = new Set();   // phones already resolved this session (avoids re-querying non-Calgo contacts)
+async function upgradeFriendsCalgoStatusFromCloud() {
+    if (!currentUser || !isSupabaseReady || _friendsCloudUpgradeRunning) return;
+    const friends = Storage.getFriends(currentUser.id);
+    const pending = friends.filter(f =>                          // same object refs as in `friends`
+        !f.calgoId && f.phone && !_triedCalgoLookupPhones.has(f.phone.replace(/\D/g, ''))
+    );
+    if (!pending.length) return;
+
+    _friendsCloudUpgradeRunning = true;
+    try {
+        let changed = false;
+        const localUsers = Storage.getUsers();
+        for (const entry of pending) {
+            _triedCalgoLookupPhones.add(entry.phone.replace(/\D/g, ''));
+            const found = await dbGetUserByPhone(entry.phone);
+            if (!found || found.id === currentUser.id) continue;
+            entry.calgoId = found.id;
+            entry.id      = found.id;                 // use the real id so future lookups work
+            entry.avatar  = found.avatar || entry.avatar;
+            entry.name    = entry.name || found.name;
+            localUsers[found.id] = found;             // cache so later renders are instant
+            changed = true;
+        }
+        if (changed) {
+            Storage.setUsers(localUsers);
+            // De-dupe by id — an upgraded contact_* entry may now collide with an
+            // existing Calgo entry for the same person; keep the one with a calgoId.
+            const byId = new Map();
+            for (const f of friends) {
+                const prev = byId.get(f.id);
+                if (!prev || (f.calgoId && !prev.calgoId)) byId.set(f.id, f);
+            }
+            const merged = Array.from(byId.values());
+            Storage.setFriends(currentUser.id, merged);
+            dbSetFriends(currentUser.id, merged);
+            renderFriends();
+        }
+    } finally {
+        _friendsCloudUpgradeRunning = false;
+    }
+}
+
+/**
  * Render a single friend chip with context-appropriate action buttons.
- * Calgo friends → 📅 View calendar, 📨 Send invite, ✕ Remove
- * Non-Calgo contacts → 💬 Invite to join Calgo, ✕ Remove + "No Calgo" badge
+ * Calgo friends     → 📅 Open calendar (separate page), 📨 Send invite, ✕ Remove
+ * Non-Calgo contacts → 📨 Send invite (same invite flow, prefilled), ✕ Remove + "No Calgo" badge
+ * The invite button is identical for both — it always opens the normal invitation modal
+ * pre-filled with this person's phone + name (never a separate "join the app" message).
  * @param {Object} friendEntry - Normalized friend entry object
  * @returns {string} HTML string
  */
@@ -2272,14 +2353,13 @@ function renderFriendChip(friendEntry) {
     const isCalgoUser    = !!friendEntry.calgoId;
     const safeName       = escapeForInlineHandlerArg(friendEntry.name);
     const removeBtn      = `<button class="friend-btn friend-btn-remove" title="Remove" onclick="confirmAndRemoveFriend('${friendEntry.id}','${safeName}')">✕</button>`;
+    const inviteBtn      = `<button class="friend-btn friend-btn-invite" title="Send invite" onclick="prefillInviteForFriend('${friendEntry.id}')">📨</button>`;
+    // Only Calgo users have a public calendar to open on its own page.
+    const openCalendarBtn = isCalgoUser
+        ? `<button class="friend-btn friend-btn-view" title="Open calendar" onclick="openFriendCalendar('${friendEntry.calgoId}')">📅</button>`
+        : '';
 
-    const actionButtons = isCalgoUser
-        ? `<button class="friend-btn friend-btn-view"   title="View calendar" onclick="window.open('${buildShareUrl(friendEntry.calgoId)}','_blank')">📅</button>
-           <button class="friend-btn friend-btn-invite" title="Send invite"    onclick="prefillInviteForFriend('${friendEntry.id}')">📨</button>
-           ${removeBtn}`
-        : `<button class="friend-btn friend-btn-join"   title="Invite to Calgo" onclick="sendJoinCalgoInvitationToFriend('${friendEntry.phone}','${safeName}')">💬 Invite</button>
-           ${removeBtn}`;
-
+    const actionButtons    = `${openCalendarBtn}${inviteBtn}${removeBtn}`;
     const calgoStatusBadge = isCalgoUser ? '' : '<div class="friend-no-calgo-badge">No Calgo</div>';
 
     return `<div class="friend-chip">
@@ -2303,6 +2383,10 @@ function renderFriends() {
     }
 
     listContainer.innerHTML = `<div class="friends-scroll">${resolvedFriends.map(renderFriendChip).join('')}</div>`;
+
+    // Resolve any "No Calgo" friends against the cloud by phone (once per phone per session),
+    // then re-render if any turn out to actually be Calgo users. Fire-and-forget.
+    upgradeFriendsCalgoStatusFromCloud();
 }
 
 /**
@@ -2332,25 +2416,50 @@ function removeFriend(friendId) {
 }
 
 /**
- * Pre-fill the single-invite modal with a Calgo friend's phone number.
- * Only valid for friends with a calgoId.
+ * Open the normal invitation modal pre-filled with any friend/contact — Calgo or not.
+ * Splits the phone into country-code + local number and sets the recipient name so the
+ * message greeting is personalized. This is the single invite path used by every friend
+ * chip's 📨 button.
  * @param {string} friendEntryId
  */
 function prefillInviteForFriend(friendEntryId) {
     const targetFriend = getResolvedFriends().find(f => f.id === friendEntryId);
-    if (!targetFriend || !targetFriend.calgoId) return;
+    if (!targetFriend) return;
+    prefillSingleInviteFor(targetFriend.phone, targetFriend.name);
+}
 
+/**
+ * Open the single-invite modal and fill in a recipient's phone + name.
+ * @param {string} phone - Any phone format (formatting is stripped)
+ * @param {string} name  - Display name used in the message greeting
+ */
+function prefillSingleInviteFor(phone, name) {
     openSingleInviteModal();
 
+    const digitsOnlyPhone = (phone || '').replace(/\D/g, '');
     const COUNTRY_CODES   = ['966','971','965','974','973','968','962','20','1','44'].sort((a,b) => b.length - a.length);
-    const digitsOnlyPhone = targetFriend.phone.replace(/^\+/, '');
+    let matched = false;
     for (const countryCode of COUNTRY_CODES) {
         if (digitsOnlyPhone.startsWith(countryCode)) {
             $('singleInviteCountryCode').value = countryCode;
             $('singleInvitePhone').value       = digitsOnlyPhone.slice(countryCode.length);
+            matched = true;
             break;
         }
     }
+    if (!matched) $('singleInvitePhone').value = digitsOnlyPhone;
+
+    if (name) {
+        singleInviteRecipientName = name;
+        const displayEl = $('singleInviteRecipientDisplay');
+        if (displayEl) { displayEl.textContent = '👤 ' + name; displayEl.style.display = 'block'; }
+    }
+}
+
+/** Open a friend's calendar on its own page (new tab), where you can view + book them. */
+function openFriendCalendar(calgoId) {
+    if (!calgoId) return;
+    window.open(buildShareUrl(calgoId), '_blank');
 }
 
 let html5QrCode = null;
@@ -3791,7 +3900,21 @@ function respondToBooking(bookingId, newStatus) {
 
     targetBooking.status      = newStatus;
     targetBooking.respondedAt = new Date().toISOString();
-    persistBooking(targetBooking);
+
+    // Save locally first (optimistic).
+    const idx = allBookings.findIndex(b => b.id === bookingId);
+    if (idx >= 0) allBookings[idx] = targetBooking;
+    Storage.setBookings(allBookings);
+    bumpCalendarDataVersion();
+
+    // Cloud sync uses UPDATE (owner-gated), NOT upsert — see dbUpdateBooking. Only warn
+    // if the cloud write genuinely fails, so a successful accept never shows "saved locally".
+    if (isSupabaseReady) {
+        dbUpdateBooking(targetBooking).catch(err => {
+            console.error('Supabase booking update failed:', err);
+            showToast('⚠️ Saved on this device — cloud sync failed. Check your connection.');
+        });
+    }
 
     if (newStatus === 'accepted') syncBookingToCalendarBlock(targetBooking);
     if (newStatus === 'rejected') removeLinkedCalendarBlock(targetBooking);
