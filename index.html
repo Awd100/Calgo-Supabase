@@ -283,6 +283,9 @@
         .friend-btn-rename { background: #f1f5f9; color: var(--text-light); }
         .friend-btn-remove { background: #fee2e2; color: var(--danger); }
         .no-friends-message { color: var(--text-light); font-size: 13px; text-align: center; padding: 14px; background: #f8fafc; border-radius: 14px; border: 2px dashed var(--border); }
+        /* ── COMPARE VIEW (my calendar + friend's, read-only) ── */
+        .compare-section { margin-bottom: 12px; }
+        #compareView .compare-cal { pointer-events: none; }   /* read-only: no day-tap navigation */
         /* ── RECENT CONTACTS ── */
         .recent-contacts-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
         .recent-contacts-title  { font-size: 13px; font-weight: 700; color: var(--text-light); display: flex; align-items: center; gap: 6px; }
@@ -816,6 +819,39 @@
     </div>
     <div style="text-align:center;margin-top:18px;">
         <button class="btn-primary" onclick="window.location.href=window.location.pathname" style="width:auto;padding:13px 30px;">📅 Get Your Own Calendar</button>
+    </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     COMPARE VIEW — my calendar + a friend's, side by side (read-only)
+══════════════════════════════════════ -->
+<div id="compareView" class="app hidden">
+    <div class="compare-section">
+        <div class="public-banner">
+            <div class="public-avatar" id="compareMyAvatar">👤</div>
+            <div>
+                <div class="public-user-name"     id="compareMyName"></div>
+                <div class="public-user-subtitle" id="compareMyTitle"></div>
+            </div>
+        </div>
+        <div class="card"><div class="compare-cal" id="compareMyCal"></div></div>
+    </div>
+    <div class="compare-section">
+        <div class="public-banner">
+            <div class="public-avatar" id="compareFriendAvatar">👤</div>
+            <div>
+                <div class="public-user-name"     id="compareFriendName"></div>
+                <div class="public-user-subtitle" id="compareFriendTitle"></div>
+            </div>
+        </div>
+        <div class="card"><div class="compare-cal" id="compareFriendCal"></div></div>
+    </div>
+    <div style="display:flex;gap:14px;justify-content:center;margin:2px 0 14px;font-size:12px;flex-wrap:wrap;">
+        <span><span style="display:inline-block;width:11px;height:11px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:3px;margin-right:4px;vertical-align:middle;"></span>Available</span>
+        <span><span style="display:inline-block;width:11px;height:11px;background:#fef2f2;border:1px solid #fecaca;border-radius:3px;margin-right:4px;vertical-align:middle;"></span><span style="color:var(--danger);font-weight:600;">Busy</span></span>
+    </div>
+    <div style="text-align:center;margin-bottom:18px;">
+        <a href="#" onclick="window.location.href=window.location.pathname;return false;" style="font-size:12px;color:var(--text-light);text-decoration:underline;">← Back to my calendar</a>
     </div>
 </div>
 
@@ -2456,10 +2492,10 @@ function prefillSingleInviteFor(phone, name) {
     }
 }
 
-/** Open a friend's calendar on its own page (new tab), where you can view + book them. */
+/** Open a friend's calendar on its own page (new tab): my calendar + theirs, read-only. */
 function openFriendCalendar(calgoId) {
     if (!calgoId) return;
-    window.open(buildShareUrl(calgoId), '_blank');
+    window.open(getBaseUrl() + '?compare=' + encodeURIComponent(calgoId), '_blank');
 }
 
 let html5QrCode = null;
@@ -4737,6 +4773,7 @@ if (!isRunningInstalled() && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgen
 async function init() {
     const params      = new URLSearchParams(window.location.search);
     const targetUid   = params.get('user');
+    const compareUid  = params.get('compare');
     const isEventLink = params.get('event');
     const addToCalgo  = params.get('add_Calgo');
 
@@ -4749,6 +4786,11 @@ async function init() {
     }
 
     showLoadingOverlay('Loading Calgo…');
+
+    if (compareUid) {
+        await enterCompareView(compareUid);
+        return;
+    }
 
     if (targetUid) {
         await initWithTargetUser(targetUid);
@@ -4803,6 +4845,81 @@ async function initWithTargetUser(targetUid) {
     const saved = Storage.getCurrentUser();
     if (saved && saved.id === targetUid) { currentUser = user; enterApp(); syncCurrentUserData(); }
     else enterPublicView(user);
+}
+
+/**
+ * Read-only comparison page opened from a friend's 📅 button: my calendar on top,
+ * the friend's below, each with a name header, no toolbar/booking/settings. Loads both
+ * people's blocks+bookings into local storage so the month renderer (owner-filtered)
+ * can draw each. Falls back to the normal public calendar if the viewer isn't logged in.
+ * @param {string} friendId
+ */
+async function enterCompareView(friendId) {
+    // Resolve "me" (read-only; works cross-tab via saved session / storage).
+    let me = currentUser || Storage.getCurrentUser();
+    if (!me && supabaseClient) {
+        try {
+            const session = (await supabaseClient.auth.getSession()).data.session;
+            if (session && session.user) {
+                me = Storage.getUsers()[session.user.id] || await dbGetUser(session.user.id) || buildUserFromSupabase(session.user);
+            }
+        } catch (e) {}
+    }
+    if (!me || me.id === friendId) {
+        // Not logged in (or somehow opening your own) → show the normal public calendar.
+        await initWithTargetUser(friendId);
+        return;
+    }
+    currentUser = me;
+
+    // Pull both calendars' data into local storage so isDayBusy(date, ownerId) resolves.
+    let friend = Storage.getUsers()[friendId] || null;
+    if (isSupabaseReady) {
+        try {
+            const [f, myBlocks, myBookings, frBlocks, frBookings] = await Promise.all([
+                friend ? Promise.resolve(friend) : dbGetUser(friendId),
+                dbGetBlocksByOwner(me.id),
+                dbGetBookingsByOwner(me.id),
+                dbGetBlocksByOwner(friendId),
+                dbGetBookingsByOwner(friendId)
+            ]);
+            friend = f || friend;
+            const blMap = {}; Storage.getBlocks().forEach(b => blMap[b.id] = b);
+            myBlocks.concat(frBlocks).forEach(b => blMap[b.id] = b); Storage.setBlocks(Object.values(blMap));
+            const bMap = {}; Storage.getBookings().forEach(b => bMap[b.id] = b);
+            myBookings.concat(frBookings).forEach(b => bMap[b.id] = b); Storage.setBookings(Object.values(bMap));
+            if (friend) { const us = Storage.getUsers(); us[friendId] = friend; Storage.setUsers(us); }
+        } catch (e) { console.error('compare load error:', e); }
+    }
+    if (!friend) {
+        hideLoadingOverlay();
+        showToast('❌ Could not load that calendar');
+        window.location.href = getBaseUrl();
+        return;
+    }
+
+    // Headers (name + avatar).
+    const applyBannerAvatar = (elId, user) => {
+        const el = $(elId); if (!el) return;
+        if (user.avatar) el.innerHTML = `<img src="${escapeHtml(user.avatar)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+        else el.textContent = (user.name || '?').charAt(0).toUpperCase();
+    };
+    $('compareMyName').textContent     = me.name || 'My calendar';
+    $('compareFriendName').textContent = friend.name || 'Friend';
+    applyBannerAvatar('compareMyAvatar', me);
+    applyBannerAvatar('compareFriendAvatar', friend);
+
+    // Render both months (read-only via CSS pointer-events on .compare-cal).
+    currentView = 'month';
+    currentDate = new Date();
+    renderMonthView($('compareMyCal'),     $('compareMyTitle'),     me.id,    false);
+    renderMonthView($('compareFriendCal'), $('compareFriendTitle'), friendId, true);
+
+    hideLoadingOverlay();
+    $('loginScreen').classList.add('hidden');
+    if ($('mainApp'))    $('mainApp').classList.add('hidden');
+    if ($('publicView')) $('publicView').classList.add('hidden');
+    $('compareView').classList.remove('hidden');
 }
 
 function initFromSavedSession() {
