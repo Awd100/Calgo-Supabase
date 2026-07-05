@@ -280,6 +280,7 @@
         .friend-btn-view   { background: #eef2ff; color: var(--primary); }
         .friend-btn-invite { background: #dcfce7; color: #16a34a; }
         .friend-btn-join   { background: #fef3c7; color: #92400e; }
+        .friend-btn-rename { background: #f1f5f9; color: var(--text-light); }
         .friend-btn-remove { background: #fee2e2; color: var(--danger); }
         .no-friends-message { color: var(--text-light); font-size: 13px; text-align: center; padding: 14px; background: #f8fafc; border-radius: 14px; border: 2px dashed var(--border); }
         /* ── RECENT CONTACTS ── */
@@ -824,6 +825,10 @@
 <div id="singleInviteModal" class="modal-overlay hidden" onclick="if(event.target===this) closeModal('singleInviteModal')">
     <div class="modal">
         <h3>👤 Invite a Friend</h3>
+        <div class="modal-field">
+            <label>Friend's Name</label>
+            <input type="text" id="singleInviteName" placeholder="Name (optional)" style="margin:0;">
+        </div>
         <div class="modal-field">
             <label>Friend's WhatsApp Number</label>
             <div class="phone-field" style="margin:0;">
@@ -2200,34 +2205,6 @@ function addFriend(calgoUser) {
 }
 
 /* ══════════════════════════════════════
-   FRIENDS — JOIN CALGO INVITATION
-   Sends a WhatsApp message inviting a non-Calgo contact to join.
-══════════════════════════════════════ */
-
-/**
- * Open WhatsApp to send a "Join Calgo" invitation to a non-Calgo contact.
- * @param {string} friendPhone  - Digits-only phone number
- * @param {string} friendName   - Contact's display name
- */
-function sendJoinCalgoInvitationToFriend(friendPhone, friendName) {
-    const whatsAppMessage = buildJoinCalgoWhatsAppMessage(friendName);
-    const cleanPhone      = friendPhone.replace(/\D/g, '');
-    window.open('https://wa.me/' + cleanPhone + '?text=' + encodeURIComponent(whatsAppMessage), '_blank');
-}
-
-/**
- * Build the WhatsApp message body for a "Join Calgo" invitation.
- * @param {string} friendName
- * @returns {string}
- */
-function buildJoinCalgoWhatsAppMessage(friendName) {
-    return getCompiledTemplate('joinCalgo', {
-        name:          friendName || '',
-        calgo_app_url: 'https://king10asd.github.io/Calgo/'
-    });
-}
-
-/* ══════════════════════════════════════
    FRIENDS — RENDERING
 ══════════════════════════════════════ */
 
@@ -2354,12 +2331,13 @@ function renderFriendChip(friendEntry) {
     const safeName       = escapeForInlineHandlerArg(friendEntry.name);
     const removeBtn      = `<button class="friend-btn friend-btn-remove" title="Remove" onclick="confirmAndRemoveFriend('${friendEntry.id}','${safeName}')">✕</button>`;
     const inviteBtn      = `<button class="friend-btn friend-btn-invite" title="Send invite" onclick="prefillInviteForFriend('${friendEntry.id}')">📨</button>`;
+    const renameBtn      = `<button class="friend-btn friend-btn-rename" title="Rename" onclick="renameFriend('${friendEntry.id}')">✏️</button>`;
     // Only Calgo users have a public calendar to open on its own page.
     const openCalendarBtn = isCalgoUser
         ? `<button class="friend-btn friend-btn-view" title="Open calendar" onclick="openFriendCalendar('${friendEntry.calgoId}')">📅</button>`
         : '';
 
-    const actionButtons    = `${openCalendarBtn}${inviteBtn}${removeBtn}`;
+    const actionButtons    = `${openCalendarBtn}${inviteBtn}${renameBtn}${removeBtn}`;
     const calgoStatusBadge = isCalgoUser ? '' : '<div class="friend-no-calgo-badge">No Calgo</div>';
 
     return `<div class="friend-chip">
@@ -2416,6 +2394,29 @@ function removeFriend(friendId) {
 }
 
 /**
+ * Permanently rename a friend in this user's own friends list. Only the local nickname
+ * changes — it does not touch the friend's real Calgo account name, just how they appear
+ * in your list (persisted to storage + cloud).
+ * @param {string} friendId
+ */
+function renameFriend(friendId) {
+    const friends = Storage.getFriends(currentUser.id);
+    const entry   = friends.find(f => f.id === friendId);
+    if (!entry) return;
+
+    const newName = prompt('Rename friend:', entry.name || '');
+    if (newName === null) return;                 // cancelled
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === entry.name) return;
+
+    entry.name = trimmed;
+    Storage.setFriends(currentUser.id, friends);
+    if (isSupabaseReady) dbSetFriends(currentUser.id, friends);
+    renderFriends();
+    showToast('✏️ Friend renamed');
+}
+
+/**
  * Open the normal invitation modal pre-filled with any friend/contact — Calgo or not.
  * Splits the phone into country-code + local number and sets the recipient name so the
  * message greeting is personalized. This is the single invite path used by every friend
@@ -2450,9 +2451,8 @@ function prefillSingleInviteFor(phone, name) {
     if (!matched) $('singleInvitePhone').value = digitsOnlyPhone;
 
     if (name) {
-        singleInviteRecipientName = name;
-        const displayEl = $('singleInviteRecipientDisplay');
-        if (displayEl) { displayEl.textContent = '👤 ' + name; displayEl.style.display = 'block'; }
+        singleInviteRecipientName   = name;
+        $('singleInviteName').value = name;
     }
 }
 
@@ -2525,8 +2525,9 @@ async function fetchAndAddFriendById(targetUserId) {
 async function startCameraQrScanner() {
     const container = $('qrScannerContainer');
     const cancelBtn = $('cancelQrScannerBtn');
-    
-    container.style.display = 'block';
+
+    container.style.display   = 'block';
+    container.style.minHeight = '260px';   // give the video room so decoding has a real frame
     cancelBtn.classList.remove('hidden');
 
     try {
@@ -2541,23 +2542,49 @@ async function startCameraQrScanner() {
     if (!html5QrCode) {
         html5QrCode = new Html5Qrcode("qrScannerContainer");
     }
-    
+
+    // Config notes for the "camera opens but nothing decodes" report:
+    //  • qrbox as a FUNCTION adapts the scan box to the actual video size — a fixed
+    //    250px box can exceed a narrow phone's video feed and silently kill decoding.
+    //  • useBarCodeDetectorIfSupported uses the browser's native, far more reliable
+    //    decoder on Android Chrome instead of the slower JS fallback.
+    const scanConfig = {
+        fps: 10,
+        qrbox: (viewfinderWidth, viewfinderHeight) => {
+            const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+            const boxSize = Math.max(150, Math.floor(minEdge * 0.75));
+            return { width: boxSize, height: boxSize };
+        },
+        aspectRatio: 1.0,
+        experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+    };
+
     try {
         await html5QrCode.start(
             { facingMode: "environment" },
-            { fps: 10, qrbox: { width: 250, height: 250 } },
-            (decodedText, decodedResult) => {
+            scanConfig,
+            (decodedText) => {
+                console.log('[Calgo QR] decoded:', decodedText);
                 stopCameraQrScanner();
                 handleScannedQrResult(decodedText);
             },
-            (errorMessage) => {
-                // Ignore routine scanning errors
-            }
+            () => { /* per-frame "no code in view" — routine, ignore */ }
         );
+        showToast('📸 Point at the QR code and hold steady');
     } catch (err) {
         console.error("QR Scanner init error:", err);
-        showToast("❌ Could not start camera. Please check permissions.");
-        stopCameraQrScanner();
+        // Retry once without the environment-camera constraint (some devices reject it).
+        try {
+            await html5QrCode.start({}, scanConfig,
+                (decodedText) => { console.log('[Calgo QR] decoded:', decodedText); stopCameraQrScanner(); handleScannedQrResult(decodedText); },
+                () => {}
+            );
+            showToast('📸 Point at the QR code and hold steady');
+        } catch (err2) {
+            console.error("QR Scanner fallback error:", err2);
+            showToast("❌ Could not start camera. Check camera permission, or use 🖼️ Upload QR.");
+            stopCameraQrScanner();
+        }
     }
 }
 
@@ -3987,7 +4014,6 @@ function addBookingToCalendar(bookingId) {
  */
 const TEMPLATE_REQUIRED_VARIABLES = {
     invite:               ['{calgo_link}'],
-    joinCalgo:            ['{calgo_app_url}'],
     bookingStatusUpdate:  ['{booker_name}', '{status}'],
     newBookingAlert:      ['{booker_name}', '{owner_name}']
 };
@@ -4005,10 +4031,6 @@ const TEMPLATE_AVAILABLE_VARIABLES = {
         { key: '{date}',         required: false },
         { key: '{time}',         required: false },
         { key: '{note}',         required: false }
-    ],
-    joinCalgo: [
-        { key: '{calgo_app_url}', required: true  },
-        { key: '{name}',          required: false }
     ],
     bookingStatusUpdate: [
         { key: '{booker_name}',  required: true  },
@@ -4035,12 +4057,6 @@ const TEMPLATE_METADATA = {
         labelAr:  'رسالة الدعوة',
         icon:     '📨',
         sublabel: 'Single & group invites'
-    },
-    joinCalgo: {
-        label:    'Join Calgo Invitation',
-        labelAr:  'دعوة للانضمام إلى Calgo',
-        icon:     '💬',
-        sublabel: 'Sent to non-Calgo contacts'
     },
     bookingStatusUpdate: {
         label:    'Booking Status Update',
@@ -4078,10 +4094,6 @@ const DEFAULT_MESSAGE_TEMPLATES = {
     invite: {
         en: `Hi {name}! 👋\n\nYou received an invitation from {sender_name} 📅\n\nDate: {date}\nTime: {time}\n{note}\nAdd to your calendar:\n👉 {calgo_link}\n\nOr open in Google Calendar:\n👉 {gcal_link}\n\n— Sent via Calgo: https://king10asd.github.io/Calgo/`,
         ar: `مرحباً {name}! 👋\n\nلديك دعوة من {sender_name} 📅\n\nالتاريخ: {date}\nالوقت: {time}\n{note}\nأضف إلى تقويمك:\n👉 {calgo_link}\n\nأو افتح في Google Calendar:\n👉 {gcal_link}\n\n— أُرسل عبر Calgo: https://king10asd.github.io/Calgo/`
-    },
-    joinCalgo: {
-        en: `Hi {name}! 👋\n\nI'm using Calgo to manage my calendar and share my availability.\n\n📅 It's free — you can:\n• Share your calendar with friends\n• Accept or reject booking requests\n• Get reminders for upcoming meetings\n\nTry it here:\n👉 {calgo_app_url}\n\n— Sent via Calgo`,
-        ar: `مرحباً {name}! 👋\n\nأنا أستخدم Calgo لإدارة تقويمي ومشاركة أوقاتي المتاحة.\n\n📅 مجاني تماماً — يمكنك:\n• مشاركة تقويمك مع أصدقائك\n• قبول أو رفض طلبات الحجز\n• الحصول على تذكيرات للمواعيد\n\nجربه هنا:\n👉 {calgo_app_url}\n\n— عبر Calgo`
     },
     bookingStatusUpdate: {
         en: `{status_emoji} Hi {booker_name}!\n\n{owner_name} has {status} your booking request.\n\n📅 Date: {date}\n🕐 Time: {time}\n\n— Calgo`,
@@ -4432,17 +4444,11 @@ async function openContactPickerForSingleInvite() {
         }
         if (!matched) $('singleInvitePhone').value = digitsOnly;
 
-        // Store name and show confirmation label under the field
+        // Fill the editable Name box with the contact's saved name (user can edit it).
         singleInviteRecipientName = contactName || null;
+        $('singleInviteName').value = contactName || '';
         const displayEl = $('singleInviteRecipientDisplay');
-        if (displayEl) {
-            if (contactName) {
-                displayEl.textContent = '👤 ' + contactName;
-                displayEl.style.display = 'block';
-            } else {
-                displayEl.style.display = 'none';
-            }
-        }
+        if (displayEl) { displayEl.style.display = 'none'; displayEl.textContent = ''; }
     } catch (contactPickerError) {
         if (contactPickerError.name !== 'AbortError') {
             console.error('Single invite contact picker error:', contactPickerError);
@@ -4495,6 +4501,7 @@ async function openContactPickerForGroupInvite() {
 
 function openSingleInviteModal() {
     singleInviteRecipientName = null;
+    $('singleInviteName').value  = '';
     $('singleInviteDate').value  = formatDateToISO(new Date());
     $('singleInvitePhone').value = '';
     $('singleInviteNote').value  = '';
@@ -4536,11 +4543,12 @@ function sendSingleInviteViaWhatsApp() {
     const start = $('singleInviteStart').value;
     const end   = $('singleInviteEnd').value;
     const note  = $('singleInviteNote').value.trim();
+    const name  = $('singleInviteName').value.trim();
     if (!phone || !date || !start || !end) { showToast('❌ Fill all fields'); return; }
     if (start >= end) { showToast('❌ End after start'); return; }
     const pastErr = pastDateTimeError(date, start); if (pastErr) { showToast(pastErr); return; }
-    window.open(`https://wa.me/${cc + phone}?text=${encodeURIComponent(buildInviteMessage(date, start, end, note, singleInviteRecipientName))}`, '_blank');
-    logRecentContact(cc + phone, singleInviteRecipientName || '', 'invited');
+    window.open(`https://wa.me/${cc + phone}?text=${encodeURIComponent(buildInviteMessage(date, start, end, note, name))}`, '_blank');
+    logRecentContact(cc + phone, name || '', 'invited');
     showToast('📨 Opening WhatsApp…');
 }
 
