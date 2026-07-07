@@ -16,6 +16,19 @@ self.addEventListener('install', event => {
     self.skipWaiting();
 });
 
+// Notification tapped → focus an existing Calgo window, or open one.
+self.addEventListener('notificationclick', event => {
+    event.notification.close();
+    const url = (event.notification.data && event.notification.data.url) || '/';
+    event.waitUntil((async () => {
+        const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        for (const client of clientList) {
+            if ('focus' in client) return client.focus();
+        }
+        if (self.clients.openWindow) return self.clients.openWindow(url);
+    })());
+});
+
 self.addEventListener('activate', event => {
     event.waitUntil((async () => {
         // Drop any old caches from previous versions.
