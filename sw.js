@@ -16,6 +16,20 @@ self.addEventListener('install', event => {
     self.skipWaiting();
 });
 
+// Background push from the Calgo server (push-reminders Edge Function).
+// Payload: { title, body, tag }
+self.addEventListener('push', event => {
+    let payload = { title: '📅 Calgo', body: '', tag: 'calgo-push' };
+    try { payload = { ...payload, ...event.data.json() }; } catch (e) { /* keep defaults */ }
+    event.waitUntil(self.registration.showNotification(payload.title, {
+        body: payload.body,
+        tag: payload.tag,
+        renotify: true,
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="20" fill="%236366f1"/><text x="50" y="68" text-anchor="middle" font-size="50">📅</text></svg>',
+        data: { url: self.registration.scope }
+    }));
+});
+
 // Notification tapped → focus an existing Calgo window, or open one.
 self.addEventListener('notificationclick', event => {
     event.notification.close();
