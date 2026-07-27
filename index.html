@@ -1304,6 +1304,11 @@ const Storage = {
     setBlocks:      (list)      => Storage.setRaw('blocks', list),
     getFriends:     (uid)       => Storage.getRaw('fr_' + uid)   || [],
     setFriends:     (uid, f)    => Storage.setRaw('fr_' + uid, f),
+    // Phones the user has explicitly promoted from "Recent" into their friends list.
+    // Kept separately so a promoted contact stays out of Recent even if the friend
+    // entry's phone field is empty/an email and the phone-digit filter can't match it.
+    getPromoted:    (uid)       => Storage.getRaw('rp_' + uid)   || [],
+    setPromoted:    (uid, list) => Storage.setRaw('rp_' + uid, list),
     getCurrentUser: ()          => Storage.getRaw('cur'),
     setCurrentUser: (user)      => Storage.setRaw('cur', user),
 };
@@ -1637,8 +1642,8 @@ async function dbGetOutgoingBookings(userId, phone) {
 
 /* ── Supabase data access: friends (one row per owner, list jsonb) ── */
 async function dbSetFriends(ownerId, list) {
-    try { const { error } = await supabaseClient.from('friends').upsert({ owner: ownerId, list }); if (error) throw error; }
-    catch (e) { console.error('friends sync error:', e.message); }
+    try { const { error } = await supabaseClient.from('friends').upsert({ owner: ownerId, list }); if (error) throw error; return true; }
+    catch (e) { console.error('friends sync error:', e.message); return false; }
 }
 async function dbGetFriends(ownerId) {
     try { const { data, error } = await supabaseClient.from('friends').select('list').eq('owner', ownerId).maybeSingle(); if (error) throw error; return data ? (data.list || []) : null; }
@@ -1676,6 +1681,10 @@ function deleteBlock(blockId) {
     if (isSupabaseReady) dbDeleteBlock(blockId);
 }
 
+/** How stale the local cache may get before a reminder pass re-pulls from the cloud. */
+const REMINDER_SYNC_MAX_AGE_MS = 10 * 60 * 1000;
+let lastReminderSyncAt = 0;
+
 async function syncCurrentUserData(opts) {
     if (!currentUser || !isSupabaseReady) return;
     const showToasts = opts && opts.manual;   // only chime for a user-triggered refresh
@@ -1693,6 +1702,7 @@ async function syncCurrentUserData(opts) {
         mergeSupabaseBookings(ownedBookings, outgoing);
         mergeSupabaseBlocks(ownedBlocks);
         await mergeFriendsFromSupabase(friendList);
+        lastReminderSyncAt = Date.now();   // any successful pull resets the staleness clock
         bumpCalendarDataVersion(); // Invalidate render cache after any data merge
         // Re-render ALL data views (elements exist even when their tab is hidden), so
         // navigating to Profile/Bookings always shows freshly-synced data without a manual
@@ -1703,8 +1713,11 @@ async function syncCurrentUserData(opts) {
         if (showToasts) showToast('✅ Up to date');
     } catch (e) {
         console.error('Sync error', e);
-        // Make a failed sync visible instead of silently showing an empty account.
-        showToast('⚠️ Couldn’t load your latest data — check your connection, then tap 🔄 Refresh.');
+        // Make a failed sync visible instead of silently showing an empty account — but
+        // stay quiet for background passes (the reminder loop), which retry on their own.
+        if (!(opts && opts.silent)) {
+            showToast('⚠️ Couldn’t load your latest data — check your connection, then tap 🔄 Refresh.');
+        }
     }
 }
 
@@ -1734,31 +1747,36 @@ function mergeSupabaseBlocks(ownedBlocks) {
 async function mergeFriendsFromSupabase(cloudFriendList) {
     if (!cloudFriendList) return;
 
-    // Merge cloud list with local list — keep the richer entry per id.
-    // "Richer" means the entry with more fields (new format beats old format).
+    // Merge cloud list with local list — keep the richer entry per PERSON.
+    // Keyed by friendIdentityKey, not by id: an entry's id is rewritten in place once a
+    // contact_<phone> is resolved to a real Calgo account, so keying by id would leave
+    // the same human in the list twice (once under each id).
     const localFriendList = Storage.getFriends(currentUser.id);
     const mergedMap       = new Map();
 
     // Add local entries first
-    localFriendList.forEach(entry => mergedMap.set(entry.id, entry));
+    localFriendList.forEach(entry => mergedMap.set(friendIdentityKey(entry), entry));
 
-    // Merge cloud entries — only overwrite if the cloud entry is richer
+    // Merge cloud entries — only overwrite if the cloud entry knows more
     cloudFriendList.forEach(cloudEntry => {
-        const localEntry = mergedMap.get(cloudEntry.id);
-        if (!localEntry) {
-            mergedMap.set(cloudEntry.id, cloudEntry);
-        } else {
-            // Keep whichever has more fields (new format has name, phone, calgoId)
-            const localFieldCount = Object.keys(localEntry).length;
-            const cloudFieldCount = Object.keys(cloudEntry).length;
-            if (cloudFieldCount > localFieldCount) {
-                mergedMap.set(cloudEntry.id, cloudEntry);
-            }
+        const identity   = friendIdentityKey(cloudEntry);
+        const localEntry = mergedMap.get(identity);
+        if (!localEntry || isRicherFriendEntry(cloudEntry, localEntry)) {
+            mergedMap.set(identity, cloudEntry);
         }
     });
 
     const mergedList = Array.from(mergedMap.values());
-    Storage.setFriends(currentUser.id, mergedList);
+
+    // Push the merge back up when it holds anything the cloud is missing. Without this a
+    // friend whose original cloud write failed lives only in localStorage forever — and
+    // disappears (back into Recent) the moment this device's storage is cleared or the
+    // account is opened somewhere else.
+    if (mergedList.length > cloudFriendList.length) {
+        saveFriendsList(mergedList, { quiet: true });
+    } else {
+        Storage.setFriends(currentUser.id, mergedList);
+    }
 
     // Fetch any Calgo user data not yet in local store
     const users = Storage.getUsers();
@@ -1976,6 +1994,77 @@ function logRecentContact(phone, name, interaction) {
 }
 
 /**
+ * Every phone number that should be hidden from Recent because the person is
+ * already a friend. Collected from two places, because neither alone is reliable:
+ *   • the entry's `phone` field — empty for QR adds, and an email for Google users;
+ *   • a `contact_<digits>` id, which encodes the phone the contact was added with.
+ * @returns {Set<string>} digits-only phone numbers
+ */
+function getFriendPhoneDigits(friends) {
+    const digitsSet = new Set();
+    friends.forEach(friend => {
+        const fromPhoneField = (friend.phone || '').replace(/\D/g, '');
+        if (fromPhoneField) digitsSet.add(fromPhoneField);
+        if (typeof friend.id === 'string' && friend.id.startsWith('contact_')) {
+            const fromId = friend.id.slice('contact_'.length).replace(/\D/g, '');
+            if (fromId) digitsSet.add(fromId);
+        }
+    });
+    return digitsSet;
+}
+
+/**
+ * Read the promotion records, tolerating the plain-string format written by earlier builds.
+ * @returns {Array<{phone: string, friendId: (string|null)}>}
+ */
+function loadPromotedContacts() {
+    if (!currentUser) return [];
+    return Storage.getPromoted(currentUser.id)
+        .map(record => (typeof record === 'string' ? { phone: record, friendId: null } : record))
+        .filter(record => record && record.phone);
+}
+
+/**
+ * Record that this phone was promoted from Recent into the friends list, so it stays out
+ * of Recent even when the resulting friend entry carries no usable phone (an `addFriend`
+ * on a Google account copies an email into the phone field).
+ * @param {string} phone
+ * @param {string|null} friendId - id of the friend entry the promotion produced
+ */
+function markContactPromoted(phone, friendId) {
+    const digitsOnly = (phone || '').replace(/\D/g, '');
+    if (!digitsOnly || !currentUser) return;
+    const promoted = loadPromotedContacts().filter(record => record.phone !== digitsOnly);
+    promoted.push({ phone: digitsOnly, friendId: friendId || null });
+    Storage.setPromoted(currentUser.id, promoted);
+}
+
+/**
+ * Phones to hide from Recent because they were promoted AND that friend is still in the
+ * list. A record whose friend has gone (removed, or lost to a failed sync) is pruned, so
+ * the contact returns to Recent and can be re-added — never invisible in both places.
+ * @param {Array<Object>} friends - resolved friends list
+ * @returns {Set<string>} digits-only phone numbers
+ */
+function getLivePromotedPhones(friends) {
+    const records = loadPromotedContacts();
+    if (!records.length) return new Set();
+
+    const friendPhones = getFriendPhoneDigits(friends);
+    const friendIds    = new Set();
+    friends.forEach(friend => {
+        if (friend.id)      friendIds.add(friend.id);
+        if (friend.calgoId) friendIds.add(friend.calgoId);
+    });
+
+    const stillFriends = records.filter(record =>
+        friendPhones.has(record.phone) || (record.friendId && friendIds.has(record.friendId))
+    );
+    if (stillFriends.length !== records.length) Storage.setPromoted(currentUser.id, stillFriends);
+    return new Set(stillFriends.map(record => record.phone));
+}
+
+/**
  * Build the merged, deduplicated, filtered list of recent contacts for display.
  * Combines the outgoing invite log with incoming booking history.
  * Excludes current user and anyone already in the friends list.
@@ -1985,9 +2074,8 @@ function getRecentContactsForDisplay() {
     if (!currentUser) return [];
 
     const existingFriends = getResolvedFriends();
-    const friendPhones    = new Set(
-        existingFriends.map(f => (f.phone || '').replace(/\D/g, '')).filter(Boolean)
-    );
+    const friendPhones    = getFriendPhoneDigits(existingFriends);
+    getLivePromotedPhones(existingFriends).forEach(digitsOnly => friendPhones.add(digitsOnly));
     const myDigits = (currentUser.phone || '').replace(/\D/g, '');
 
     // Start with outgoing invite log
@@ -2100,11 +2188,14 @@ function addRecentContactAsFriend(phone, name) {
         u.phone && u.phone.replace(/\D/g, '') === phone
     );
 
+    let newFriendId;
     if (matchingUser) {
         addFriend(matchingUser);
+        newFriendId = matchingUser.id;
     } else {
+        newFriendId = 'contact_' + phone;
         persistFriendEntry({
-            id:      'contact_' + phone,
+            id:      newFriendId,
             name:    name || phone,
             phone,
             avatar:  null,
@@ -2112,6 +2203,11 @@ function addRecentContactAsFriend(phone, name) {
             addedAt: new Date().toISOString()
         });
     }
+
+    // Durable record of the promotion. Without it, this contact reappears in Recent
+    // the moment the friend entry's phone stops matching the log entry's digits
+    // (e.g. addFriend() copies a Google account's email into the phone field).
+    markContactPromoted(phone, newFriendId);
 
     renderRecentContactsSection();
     renderFriends();
@@ -2199,8 +2295,78 @@ function buildFriendEntryForContact(contactName, rawPhone) {
     };
 }
 
+/* ══════════════════════════════════════
+   FRIENDS — IDENTITY & PERSISTENCE
+   A friend entry's `id` is NOT stable: upgradeFriendsCalgoStatusFromCloud() rewrites
+   contact_<phone> into the person's real Calgo id once it finds their account. Every
+   dedupe/merge therefore keys on the PERSON (phone, then Calgo account, then id).
+══════════════════════════════════════ */
+
 /**
- * Persist a friend entry to localStorage and Firestore, with deduplication by id.
+ * Stable per-person key for a friend entry.
+ * @param {Object} entry
+ * @returns {string}
+ */
+function friendIdentityKey(entry) {
+    const phoneDigits = (entry.phone || '').replace(/\D/g, '');
+    if (phoneDigits) return 'phone:' + phoneDigits;
+    if (entry.calgoId) return 'calgo:' + entry.calgoId;
+    return 'id:' + entry.id;
+}
+
+/**
+ * Which of two entries for the same person to keep: a resolved Calgo account always
+ * wins; otherwise the one carrying more fields (new format beats old format).
+ * @param {Object} candidate
+ * @param {Object} current
+ * @returns {boolean} True if candidate should replace current
+ */
+function isRicherFriendEntry(candidate, current) {
+    if (!!candidate.calgoId !== !!current.calgoId) return !!candidate.calgoId;
+    return Object.keys(candidate).length > Object.keys(current).length;
+}
+
+/**
+ * Collapse duplicate entries for the same person, keeping the richer one.
+ * @param {Array<Object>} list
+ * @returns {Array<Object>}
+ */
+function dedupeFriends(list) {
+    const byIdentity = new Map();
+    for (const entry of list) {
+        const identity = friendIdentityKey(entry);
+        const existing = byIdentity.get(identity);
+        if (!existing || isRicherFriendEntry(entry, existing)) byIdentity.set(identity, entry);
+    }
+    return Array.from(byIdentity.values());
+}
+
+/**
+ * The ONE place the friends list is written. Saves locally first (always succeeds),
+ * then mirrors to the cloud with a single retry. A silently-dropped cloud write is
+ * what makes a freshly added friend come back as a Recent contact after a refresh,
+ * so a write that never lands is surfaced instead of only hitting the console.
+ * @param {Array<Object>} list
+ * @param {{quiet?: boolean}} [opts] - quiet: suppress the failure toast (background paths)
+ */
+function saveFriendsList(list, opts) {
+    if (!currentUser) return;
+    Storage.setFriends(currentUser.id, list);
+    if (!isSupabaseReady) return;
+
+    const ownerId = currentUser.id;
+    (async () => {
+        if (await dbSetFriends(ownerId, list)) return;
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        if (await dbSetFriends(ownerId, list)) return;
+        if (!(opts && opts.quiet)) {
+            showToast('⚠️ Friends saved on this device only — cloud sync failed. Tap 🔄 Refresh.');
+        }
+    })();
+}
+
+/**
+ * Persist a friend entry to localStorage and the cloud, with deduplication by id.
  * @param {Object} friendEntry
  * @returns {boolean} True if newly added, false if duplicate
  */
@@ -2225,17 +2391,14 @@ function persistFriendEntry(friendEntry) {
             );
             if (existingIndex >= 0 && friendEntry.calgoId && !existingFriends[existingIndex].calgoId) {
                 existingFriends[existingIndex] = { ...existingFriends[existingIndex], ...friendEntry };
-                Storage.setFriends(currentUser.id, existingFriends);
-                if (isSupabaseReady) dbSetFriends(currentUser.id, existingFriends);
+                saveFriendsList(existingFriends);
                 return true; // Upgraded existing entry
             }
             return false; // Duplicate phone, no upgrade needed
         }
     }
 
-    const updatedFriends = [...existingFriends, friendEntry];
-    Storage.setFriends(currentUser.id, updatedFriends);
-    if (isSupabaseReady) dbSetFriends(currentUser.id, updatedFriends);
+    saveFriendsList([...existingFriends, friendEntry]);
     return true;
 }
 
@@ -2310,13 +2473,13 @@ function getResolvedFriends() {
         };
     }).filter(Boolean);
 
-    // Persist upgrades silently so next load has clean data
-    if (needsResave) {
-        Storage.setFriends(currentUser.id, resolved);
-        if (isSupabaseReady) dbSetFriends(currentUser.id, resolved);
-    }
-
-    return resolved;
+    // Persist upgrades silently so next load has clean data. Upgrading a contact_<phone>
+    // entry to a real Calgo id can make it collide with an existing entry for the same
+    // person, so collapse duplicates in the same pass.
+    if (!needsResave) return resolved;
+    const deduped = dedupeFriends(resolved);
+    saveFriendsList(deduped, { quiet: true });
+    return deduped;
 }
 
 /**
@@ -2330,20 +2493,36 @@ let _friendsCloudUpgradeRunning = false;
 const _triedCalgoLookupPhones   = new Set();   // phones already resolved this session (avoids re-querying non-Calgo contacts)
 async function upgradeFriendsCalgoStatusFromCloud() {
     if (!currentUser || !isSupabaseReady || _friendsCloudUpgradeRunning) return;
-    const friends = Storage.getFriends(currentUser.id);
-    const pending = friends.filter(f =>                          // same object refs as in `friends`
+    const pending = Storage.getFriends(currentUser.id).filter(f =>
         !f.calgoId && f.phone && !_triedCalgoLookupPhones.has(f.phone.replace(/\D/g, ''))
     );
     if (!pending.length) return;
 
     _friendsCloudUpgradeRunning = true;
     try {
-        let changed = false;
-        const localUsers = Storage.getUsers();
+        // ── Phase 1: network only ──
+        // Deliberately does NOT hold on to the list read above. Each lookup is a round
+        // trip, so this loop can run for seconds — long enough for the user to add a
+        // friend from Recent. Writing a pre-await snapshot back afterwards would delete
+        // that friend from localStorage AND from the cloud, which is exactly why a newly
+        // added friend used to reappear in Recent after a refresh.
+        const resolvedByPhone = new Map();
         for (const entry of pending) {
-            _triedCalgoLookupPhones.add(entry.phone.replace(/\D/g, ''));
+            const phoneDigits = entry.phone.replace(/\D/g, '');
+            _triedCalgoLookupPhones.add(phoneDigits);
             const found = await dbGetUserByPhone(entry.phone);
-            if (!found || found.id === currentUser.id) continue;
+            if (found && found.id !== currentUser.id) resolvedByPhone.set(phoneDigits, found);
+        }
+        if (!resolvedByPhone.size) return;
+
+        // ── Phase 2: re-read the CURRENT list and apply the upgrades to it ──
+        const friends    = Storage.getFriends(currentUser.id);
+        const localUsers = Storage.getUsers();
+        let   changed    = false;
+        for (const entry of friends) {
+            if (entry.calgoId || !entry.phone) continue;
+            const found = resolvedByPhone.get(entry.phone.replace(/\D/g, ''));
+            if (!found) continue;
             entry.calgoId = found.id;
             entry.id      = found.id;                 // use the real id so future lookups work
             entry.avatar  = found.avatar || entry.avatar;
@@ -2351,20 +2530,13 @@ async function upgradeFriendsCalgoStatusFromCloud() {
             localUsers[found.id] = found;             // cache so later renders are instant
             changed = true;
         }
-        if (changed) {
-            Storage.setUsers(localUsers);
-            // De-dupe by id — an upgraded contact_* entry may now collide with an
-            // existing Calgo entry for the same person; keep the one with a calgoId.
-            const byId = new Map();
-            for (const f of friends) {
-                const prev = byId.get(f.id);
-                if (!prev || (f.calgoId && !prev.calgoId)) byId.set(f.id, f);
-            }
-            const merged = Array.from(byId.values());
-            Storage.setFriends(currentUser.id, merged);
-            dbSetFriends(currentUser.id, merged);
-            renderFriends();
-        }
+        if (!changed) return;
+
+        Storage.setUsers(localUsers);
+        // An upgraded contact_* entry may now collide with an existing Calgo entry for
+        // the same person; dedupeFriends keeps the one with a calgoId.
+        saveFriendsList(dedupeFriends(friends), { quiet: true });
+        renderFriends();
     } finally {
         _friendsCloudUpgradeRunning = false;
     }
@@ -2443,9 +2615,9 @@ function confirmAndRemoveFriend(friendId, friendName) {
  * @param {string} friendId
  */
 function removeFriend(friendId) {
-    const updatedFriends = Storage.getFriends(currentUser.id).filter(entry => entry.id !== friendId);
-    Storage.setFriends(currentUser.id, updatedFriends);
-    if (isSupabaseReady) dbSetFriends(currentUser.id, updatedFriends);
+    // The promotion record for this person is left alone — getLivePromotedPhones()
+    // prunes it on the next render, which puts them back in Recent to be re-added.
+    saveFriendsList(Storage.getFriends(currentUser.id).filter(entry => entry.id !== friendId));
     renderFriends();
     showToast('Removed from friends');
 }
@@ -2467,8 +2639,7 @@ function renameFriend(friendId) {
     if (!trimmed || trimmed === entry.name) return;
 
     entry.name = trimmed;
-    Storage.setFriends(currentUser.id, friends);
-    if (isSupabaseReady) dbSetFriends(currentUser.id, friends);
+    saveFriendsList(friends);
     renderFriends();
     showToast('✏️ Friend renamed');
 }
@@ -5284,6 +5455,7 @@ function renderReminderSettingsSection() {
             <button onclick="sendTestBackgroundPush()" style="padding:9px 14px;background:#f0fdf4;color:#16a34a;border:2px solid var(--border);border-radius:11px;font-weight:700;font-size:12px;cursor:pointer;width:auto;" title="Sent by the Calgo server — works even when the app is closed">🚀 Test background push</button>
         </div>
         <div style="font-size:11px;color:var(--text-light);margin-top:6px;">🚀 Background push = reminders &amp; daily digest arrive even when Calgo is closed.</div>
+        ${lastBackgroundPushError ? `<div style="font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:7px 9px;margin-top:6px;">⚠️ This device isn't registered for background push: ${escapeHtml(lastBackgroundPushError)}</div>` : ''}
         <div style="margin-top:12px;">
             <div style="font-size:12px;font-weight:600;color:var(--text-light);margin-bottom:5px;">Remind me before confirmed bookings:</div>
             <div class="reminder-chips-row">${acceptedChipsHtml}</div>
@@ -5399,23 +5571,80 @@ function urlBase64ToUint8Array(base64String) {
     return Uint8Array.from([...raw].map(ch => ch.charCodeAt(0)));
 }
 
+/** Give up on the push service after this long — see withPushTimeout. */
+const PUSH_SUBSCRIBE_TIMEOUT_MS = 15000;
+
+/** Why background push isn't registered on this device (shown in Reminder Settings). */
+let lastBackgroundPushError = null;
+
+/**
+ * Race a promise against a timeout.
+ * pushManager.subscribe() does NOT reject when the browser has no working connection to
+ * its push service — it simply never settles. Awaiting it bare leaves registration hung
+ * forever with nothing logged, which is why no device was ever registered.
+ * @param {Promise} promise
+ * @param {number} timeoutMs
+ * @param {string} label - what we were waiting on, used in the error message
+ */
+function withPushTimeout(promise, timeoutMs, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error(`${label} didn't respond within ${Math.round(timeoutMs / 1000)}s`)),
+            timeoutMs
+        ))
+    ]);
+}
+
+/**
+ * True on iPhone/iPad when Calgo is running in a normal Safari tab. Apple only permits
+ * Web Push from a PWA added to the Home Screen; in a tab, subscribe() hangs or throws.
+ * @returns {boolean}
+ */
+function isIosWithoutInstalledPwa() {
+    const ua    = navigator.userAgent || '';
+    const isIos = /iPad|iPhone|iPod/.test(ua) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (!isIos) return false;
+    const isStandalone = window.navigator.standalone === true ||
+                         (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+    return !isStandalone;
+}
+
 /**
  * Subscribe this device to background push and register it in Supabase.
  * Safe to call repeatedly (getSubscription reuses the existing one; upsert by endpoint).
- * Fire-and-forget from the permission/init paths — failures only log.
+ * @param {{notify?: boolean}} [opts] - notify: tell the user why it failed via a toast
+ * @returns {Promise<boolean>} True once this device is registered
  */
-async function enableBackgroundPush() {
-    if (!currentUser || !isSupabaseReady) return false;
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return false;
-    if (Notification.permission !== 'granted') return false;
+async function enableBackgroundPush(opts) {
+    const shouldNotify = !!(opts && opts.notify);
+    const fail = (reason) => {
+        lastBackgroundPushError = reason;
+        console.warn('[Calgo] background push not registered:', reason);
+        if (shouldNotify) showToast('⚠️ Background push off — ' + reason);
+        try { renderReminderSettingsSection(); } catch (e) { /* settings tab not built yet */ }
+        return false;
+    };
+
+    if (!currentUser || !isSupabaseReady) return fail('not signed in yet');
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        return fail('this browser has no Web Push support');
+    }
+    if (Notification.permission !== 'granted') return fail('notification permission not granted');
+    if (isIosWithoutInstalledPwa()) {
+        return fail('on iPhone/iPad, add Calgo to your Home Screen first — Apple only allows background push from an installed app');
+    }
+
     try {
-        const reg = await navigator.serviceWorker.ready;
+        const reg = await withPushTimeout(
+            navigator.serviceWorker.ready, PUSH_SUBSCRIBE_TIMEOUT_MS, 'the service worker');
         let sub = await reg.pushManager.getSubscription();
         if (!sub) {
-            sub = await reg.pushManager.subscribe({
+            sub = await withPushTimeout(reg.pushManager.subscribe({
                 userVisibleOnly: true,
                 applicationServerKey: urlBase64ToUint8Array(PUSH_VAPID_PUBLIC_KEY)
-            });
+            }), PUSH_SUBSCRIBE_TIMEOUT_MS, 'the browser push service');
         }
         const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'Asia/Riyadh';
         const { error } = await supabaseClient.from('push_subscriptions').upsert({
@@ -5425,11 +5654,14 @@ async function enableBackgroundPush() {
             tz
         });
         if (error) throw error;
+
+        lastBackgroundPushError = null;
         console.log('[Calgo] background push registered');
+        if (shouldNotify) showToast('✅ This device is registered for background push');
+        try { renderReminderSettingsSection(); } catch (e) { /* settings tab not built yet */ }
         return true;
     } catch (e) {
-        console.warn('[Calgo] background push setup failed:', e && e.message);
-        return false;
+        return fail((e && e.message) || 'unknown error');
     }
 }
 
@@ -5448,8 +5680,9 @@ async function disableBackgroundPushForThisDevice() {
 /** Ask the server to send a real background push to this account's devices. */
 async function sendTestBackgroundPush() {
     if (!isSupabaseReady || !currentUser) { showToast('⚠️ Sign in first'); return; }
-    const registered = await enableBackgroundPush();   // make sure this device is subscribed
-    if (!registered) { showToast('⚠️ Could not register this device for push'); return; }
+    // notify:true so a failure explains itself instead of a generic "could not register".
+    const registered = await enableBackgroundPush({ notify: true });
+    if (!registered) return;
     showToast('🚀 Requesting server push…');
     try {
         const { data, error } = await supabaseClient.functions.invoke('push-reminders', { body: { test: true } });
@@ -5564,6 +5797,34 @@ function pruneStaleNotificationKeys() {
     }
 }
 
+/* ── BOOKING OWNERSHIP ── */
+
+/**
+ * Did the current user make this booking on someone else's calendar?
+ * Matches on bookerId first — that's the reliable key the rest of the app writes. The
+ * phone comparison is only a fallback for records created before bookerId was stored,
+ * and never matches a Google account whose "phone" field holds an email address.
+ * @param {Object} booking
+ * @returns {boolean}
+ */
+function isBookingBookedByMe(booking) {
+    if (!currentUser || !booking) return false;
+    if (booking.bookerId && booking.bookerId === currentUser.id) return true;
+    const myPhone = normalizePhoneNumber(currentUser.phone);
+    if (!myPhone || myPhone.includes('@')) return false;
+    return normalizePhoneNumber(booking.bookerPhone) === myPhone;
+}
+
+/**
+ * Is this booking on my calendar, or one I made on someone else's?
+ * @param {Object} booking
+ * @returns {boolean}
+ */
+function isBookingMine(booking) {
+    if (!currentUser || !booking) return false;
+    return booking.owner === currentUser.id || isBookingBookedByMe(booking);
+}
+
 /* ── 1.2a: ACCEPTED BOOKING REMINDERS ── */
 
 /**
@@ -5581,9 +5842,7 @@ function checkAndFireAcceptedBookingReminders() {
     const alreadyNotified = Storage.getRaw(notifiedKey) || [];
 
     const todaysAcceptedBookings = Storage.getBookings().filter(b =>
-        b.status === 'accepted' &&
-        b.date   === todayStr   &&
-        (b.owner === currentUser.id || normalizePhoneNumber(b.bookerPhone) === normalizePhoneNumber(currentUser.phone))
+        b.status === 'accepted' && b.date === todayStr && isBookingMine(b)
     );
 
     todaysAcceptedBookings.forEach(booking => {
@@ -5592,17 +5851,22 @@ function checkAndFireAcceptedBookingReminders() {
         const [bookingHour, bookingMinute] = booking.start.split(':').map(Number);
         const bookingTotalMinutes = bookingHour * 60 + bookingMinute;
         const minutesUntilBooking = bookingTotalMinutes - currentMinutes;
+        const endTotalMinutes     = parseTimeToHours(booking.end) * 60;
 
-        if (minutesUntilBooking > 0 && minutesUntilBooking <= settings.minutesBefore) {
-            const ownerName  = Storage.getUsers()[booking.owner]?.name || 'Someone';
-            const isOutgoing = normalizePhoneNumber(booking.bookerPhone) === normalizePhoneNumber(currentUser.phone);
-            const title      = isOutgoing
-                ? `📅 Reminder: Appointment with ${ownerName}`
-                : `📅 Upcoming: ${booking.bookerName}`;
-            fireNotification(title, `Today at ${booking.start} – ${booking.end}`, 'reminder-' + booking.id);
-            alreadyNotified.push(booking.id);
-            Storage.setRaw(notifiedKey, alreadyNotified);
-        }
+        // Normally: inside the reminder window. Also catch up on a window we slept through —
+        // background tabs throttle setInterval, so the whole window can elapse unseen. A late
+        // "starting now" beats silence, and the per-booking notified list stops repeats.
+        const isInWindow    = minutesUntilBooking > 0 && minutesUntilBooking <= settings.minutesBefore;
+        const isHappeningNow = minutesUntilBooking <= 0 && currentMinutes < endTotalMinutes;
+        if (!isInWindow && !isHappeningNow) return;
+
+        const ownerName  = Storage.getUsers()[booking.owner]?.name || 'Someone';
+        const isOutgoing = isBookingBookedByMe(booking) && booking.owner !== currentUser.id;
+        const who        = isOutgoing ? `Appointment with ${ownerName}` : booking.bookerName;
+        const title      = isHappeningNow ? `📅 Happening now: ${who}` : (isOutgoing ? `📅 Reminder: ${who}` : `📅 Upcoming: ${who}`);
+        fireNotification(title, `Today at ${booking.start} – ${booking.end}`, 'reminder-' + booking.id);
+        alreadyNotified.push(booking.id);
+        Storage.setRaw(notifiedKey, alreadyNotified);
     });
 }
 
@@ -5678,41 +5942,90 @@ function checkAndFireDailyDigest() {
     const currentTotalMinutes = currentHour * 60 + currentMinute;
     if (currentTotalMinutes < digestDueMinutes) return;
 
-    const todaysBookings = Storage.getBookings().filter(b =>
-        b.date   === todayStr &&
-        b.status === 'accepted' &&
-        (b.owner === currentUser.id || normalizePhoneNumber(b.bookerPhone) === normalizePhoneNumber(currentUser.phone))
-    );
-
-    const { title, body } = buildDailyDigestNotificationMessage(todaysBookings);
+    const { title, body } = buildDailyDigestNotificationMessage(collectTodaysAgenda(todayStr));
     fireNotification(title, body, 'daily-digest-' + todayStr);
     Storage.setRaw(digestKey, true);
 }
 
 /**
+ * Everything that makes a day busy for the current user, as one time-sorted list:
+ *   • accepted bookings — on my calendar or ones I booked on someone else's;
+ *   • pending requests waiting on my calendar;
+ *   • manual busy slots (the `blocks` table) — my own blocked-out hours.
+ * The digest used to count accepted bookings only, so a day packed with blocked hours
+ * still reported "No bookings today". This matches what isDayBusy() shows on the calendar.
+ * @param {string} dateStr - 'YYYY-MM-DD'
+ * @returns {Array<{start: string, end: string, kind: string, label: string}>}
+ */
+function collectTodaysAgenda(dateStr) {
+    if (!currentUser) return [];
+    const agenda = [];
+
+    Storage.getBookings().forEach(booking => {
+        if (booking.date !== dateStr) return;
+        const isOwner = booking.owner === currentUser.id;
+        if (booking.status === 'accepted' && isBookingMine(booking)) {
+            agenda.push({ start: booking.start, end: booking.end, kind: 'booking',
+                          label: booking.bookerName || 'Booking' });
+        } else if (booking.status === 'pending' && isOwner) {
+            agenda.push({ start: booking.start, end: booking.end, kind: 'pending',
+                          label: booking.bookerName || 'Request' });
+        }
+    });
+
+    getBlocksForDate(dateStr, currentUser.id).forEach(block => {
+        agenda.push({ start: block.start, end: block.end, kind: 'busy',
+                      label: block.label || 'Busy' });
+    });
+
+    return agenda.sort((a, b) => a.start.localeCompare(b.start));
+}
+
+/**
  * Build the title and body for the daily digest notification.
- * @param {Array} bookings - Today's accepted bookings
+ * @param {Array<{start: string, kind: string, label: string}>} agenda - collectTodaysAgenda() output
  * @returns {{ title: string, body: string }}
  */
-function buildDailyDigestNotificationMessage(bookings) {
-    if (!bookings.length) {
-        return { title: '📅 Calgo — Daily Digest', body: 'No bookings today. Enjoy your free day!' };
+function buildDailyDigestNotificationMessage(agenda) {
+    if (!agenda.length) {
+        return { title: '📅 Calgo — Daily Digest', body: 'Nothing on your calendar today. Enjoy your free day!' };
     }
-    const sorted   = [...bookings].sort((a, b) => a.start.localeCompare(b.start));
-    const firstBooking = sorted[0];
-    const title    = `📅 Today: ${bookings.length} booking${bookings.length > 1 ? 's' : ''}`;
-    const body     = `Next at ${firstBooking.start}${bookings.length > 1 ? ` + ${bookings.length - 1} more` : ''}`;
-    return { title, body };
+
+    const bookingCount = agenda.filter(item => item.kind === 'booking').length;
+    const pendingCount = agenda.filter(item => item.kind === 'pending').length;
+    const busyCount    = agenda.filter(item => item.kind === 'busy').length;
+
+    const summaryParts = [];
+    if (bookingCount) summaryParts.push(`${bookingCount} booking${bookingCount > 1 ? 's' : ''}`);
+    if (pendingCount) summaryParts.push(`${pendingCount} pending`);
+    if (busyCount)    summaryParts.push(`${busyCount} busy slot${busyCount > 1 ? 's' : ''}`);
+
+    const firstItem = agenda[0];
+    return {
+        title: `📅 Today: ${summaryParts.join(' · ')}`,
+        body:  `First at ${firstItem.start} — ${firstItem.label}` +
+               (agenda.length > 1 ? ` · ${agenda.length - 1} more` : '')
+    };
 }
 
 /* ── LOOP ── */
 
 /**
  * Run all reminder checks in one pass.
- * Called by the polling loop every 5 minutes.
+ * Called by the polling loop every 5 minutes, and whenever the tab becomes visible.
  */
-function runAllReminderChecks() {
+async function runAllReminderChecks() {
     if (Notification.permission !== 'granted' || !currentUser) return;
+
+    // Every check below reads localStorage. Without a periodic re-pull, a booking that
+    // was accepted on another device is invisible here until the user happens to refocus
+    // the tab — a silent missed reminder.
+    if (isSupabaseReady && !visitedUser && Date.now() - lastReminderSyncAt > REMINDER_SYNC_MAX_AGE_MS) {
+        lastReminderSyncAt = Date.now();
+        await syncCurrentUserData({ silent: true });
+        if (!currentUser) return;                 // logged out while syncing
+    }
+
     pruneStaleNotificationKeys();
     checkAndFireAcceptedBookingReminders();
     checkAndFirePendingBookingAlerts();
@@ -5738,7 +6051,11 @@ function stopBookingReminderLoop() {
 function initNotificationReminders() {
     if ('Notification' in window && Notification.permission === 'granted') {
         startBookingReminderLoop();
-        enableBackgroundPush();   // keep this device's server-push registration fresh
+        // Keep this device's server-push registration fresh. The push service is often
+        // unreachable in the first seconds after a cold start, so retry once quietly.
+        enableBackgroundPush().then(registered => {
+            if (!registered) setTimeout(() => enableBackgroundPush(), 30000);
+        });
     }
 }
 
