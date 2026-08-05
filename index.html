@@ -553,6 +553,177 @@
             .modal-overlay { align-items: flex-start; padding-top: 40px; }
             .profile-dropdown { right: -10px; }
         }
+
+        /* ══════════════════════════════════════
+           DESK DISPLAY MODE
+           A full-screen ambient clock + today's remaining hours, for leaving an
+           old phone/tablet standing on a desk. Fully self-contained: every colour
+           comes from --disp-* properties set by applyDisplayTheme(), so nothing
+           here depends on (or disturbs) the app's :root palette.
+           z-index 1500 = above modals (1000), below toasts (2000) so a "wallpaper
+           too large" warning is still readable, and below the loading overlay.
+        ══════════════════════════════════════ */
+        #displayMode {
+            position: fixed; inset: 0; z-index: 1500; overflow: hidden;
+            background: #0b1020; color: var(--disp-fg, #fff);
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            transition: filter 1.2s ease;
+            user-select: none; -webkit-user-select: none;
+            cursor: default;
+        }
+        /* Scheduled night dimming — one filter on the root dims wallpaper and text together. */
+        #displayMode.dimmed { filter: brightness(var(--disp-dim, 0.35)); }
+
+        .disp-wall {
+            position: absolute; inset: 0;
+            background: var(--disp-bg, #0b1020);
+            background-size: cover; background-position: center;
+        }
+        /* Only shown over a photo wallpaper, so text stays readable on any picture. */
+        .disp-scrim { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(0,0,0,0.62), rgba(0,0,0,0.34)); display: none; }
+        #displayMode.has-photo .disp-scrim { display: block; }
+
+        .disp-shell {
+            position: relative; height: 100%; width: 100%;
+            display: grid; gap: clamp(10px, 2.4vmin, 30px);
+            padding: clamp(14px, 3.4vmin, 46px);
+            /* Burn-in drift — nudged a few px each minute by driftDisplayLayout(). */
+            transition: transform 3s ease-in-out;
+        }
+        @media (orientation: landscape) { .disp-shell { grid-template-columns: 40% 1fr; grid-template-rows: 100%; } }
+        @media (orientation: portrait)  { .disp-shell { grid-template-columns: 100%; grid-template-rows: auto 1fr; } }
+
+        /* ── Clock pane ── */
+        .disp-clock { display: flex; flex-direction: column; justify-content: center; min-width: 0; min-height: 0; }
+        @media (orientation: portrait) { .disp-clock { align-items: center; text-align: center; } }
+        .disp-time {
+            font-size: var(--disp-clock-size, 90px);
+            line-height: 0.95; font-weight: 700; letter-spacing: -0.03em;
+            font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1;
+            white-space: nowrap;
+            /* Shrink-to-fit so fitDisplayLayout() can measure the real text width. */
+            width: max-content; max-width: none;
+        }
+        .disp-time .disp-secs { font-size: 0.4em; font-weight: 600; opacity: 0.55; margin-left: 0.12em; letter-spacing: 0; }
+        .disp-time .disp-ampm { font-size: 0.28em; font-weight: 700; opacity: 0.6; margin-left: 0.2em; letter-spacing: 0.06em; }
+        .disp-date    { font-size: clamp(13px, 2.5vmin, 28px); font-weight: 600; opacity: 0.72; margin-top: 0.7em; }
+        .disp-owner   { font-size: clamp(11px, 1.8vmin, 19px); font-weight: 600; opacity: 0.45; margin-top: 0.35em; }
+        .disp-next {
+            margin-top: clamp(12px, 2.6vmin, 30px);
+            border-left: 4px solid var(--disp-accent, #6366f1);
+            padding: 0.25em 0 0.25em 0.7em;
+            font-size: clamp(12px, 2.1vmin, 24px); line-height: 1.45;
+        }
+        @media (orientation: portrait) { .disp-next { border-left: none; border-top: 3px solid var(--disp-accent, #6366f1); padding: 0.6em 0 0; } }
+        .disp-next-label { opacity: 0.5; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.72em; }
+        .disp-next-text  { font-weight: 700; }
+        .disp-next-when  { opacity: 0.6; font-weight: 600; }
+        .disp-summary    { margin-top: clamp(8px, 1.6vmin, 18px); font-size: clamp(11px, 1.8vmin, 19px); font-weight: 600; opacity: 0.5; }
+
+        /* ── Agenda pane ── */
+        .disp-agenda { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+        .disp-agenda-scroll { display: flex; flex-direction: column; gap: var(--disp-row-gap, 5px); overflow-y: auto; flex: 1; min-height: 0; }
+        .disp-row {
+            display: flex; align-items: center; gap: clamp(8px, 1.6vmin, 18px);
+            height: var(--disp-row-h, 44px); flex: 0 0 var(--disp-row-h, 44px);
+            padding: 0 clamp(8px, 1.6vmin, 18px);
+            border-radius: clamp(8px, 1.2vmin, 16px);
+            font-size: calc(var(--disp-row-h, 44px) * 0.36);
+            background: var(--disp-free-bg, rgba(255,255,255,0.05));
+            border: 1px solid transparent;
+        }
+        .disp-row-time  { flex: 0 0 auto; width: 4.6em; font-weight: 700; font-variant-numeric: tabular-nums; opacity: 0.62; }
+        .disp-row-text  { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; opacity: 0.5; }
+        .disp-row.busy  { background: var(--disp-busy-bg, rgba(239,68,68,0.22)); }
+        /* Both cells take the busy foreground — on an opaque busy fill (E-Ink) the
+           inherited page colour would be dark-on-dark and unreadable. */
+        .disp-row.busy .disp-row-time { opacity: 0.8; color: var(--disp-busy-fg, #fecaca); }
+        .disp-row.busy .disp-row-text { opacity: 1; font-weight: 700; color: var(--disp-busy-fg, #fecaca); }
+        .disp-row.now   { border-color: var(--disp-accent, #6366f1); box-shadow: 0 0 0 1px var(--disp-accent, #6366f1); }
+        /* On an opaque busy fill the accent outline disappears — mark "now" in the
+           busy foreground instead so the current hour is obvious in every theme. */
+        .disp-row.now.busy { border-color: var(--disp-busy-fg, #fecaca); box-shadow: 0 0 0 1px var(--disp-busy-fg, #fecaca); }
+        .disp-empty {
+            flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            text-align: center; gap: 0.4em; opacity: 0.75;
+        }
+        .disp-empty-icon { font-size: clamp(40px, 11vmin, 110px); }
+        .disp-empty-text { font-size: clamp(15px, 3vmin, 34px); font-weight: 700; }
+        .disp-empty-sub  { font-size: clamp(11px, 1.8vmin, 19px); font-weight: 600; opacity: 0.6; }
+
+        /* ── Controls — revealed on tap, auto-hidden so a brushed screen doesn't exit ── */
+        .disp-controls {
+            position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+            display: flex; gap: 8px; z-index: 3;
+            opacity: 0; pointer-events: none; transition: opacity 0.35s ease;
+        }
+        .disp-controls.show { opacity: 1; pointer-events: auto; }
+        .disp-ctrl-btn {
+            width: auto; margin: 0; padding: 10px 18px; border-radius: 50px; cursor: pointer;
+            font-size: 13px; font-weight: 700; font-family: inherit;
+            border: 1px solid rgba(255,255,255,0.28); background: rgba(15,23,42,0.72); color: #fff;
+            backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        }
+        /* The app behind the overlay must not keep its own scrollbar visible. */
+        body.disp-open { overflow: hidden; }
+
+        .disp-status {
+            /* Top-left — empty in both orientations (the clock is vertically centred
+               in landscape and horizontally centred in portrait), so it never sits on
+               top of a timeline row. */
+            position: absolute; left: 14px; top: 10px; z-index: 3;
+            font-size: 11px; font-weight: 700; opacity: 0.4;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .disp-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; }
+        .disp-status.offline .disp-status-dot { background: #f59e0b; }
+
+        /* ── In-overlay settings sheet — edit the look while watching it change ── */
+        .disp-sheet {
+            position: absolute; top: 0; right: 0; bottom: 0; z-index: 4;
+            width: min(380px, 100%); overflow-y: auto;
+            padding: 20px 20px 34px;
+            background: rgba(12,17,32,0.93); color: #fff;
+            backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+            border-left: 1px solid rgba(255,255,255,0.12);
+            transform: translateX(100%); transition: transform 0.3s cubic-bezier(0.16,1,0.3,1);
+        }
+        .disp-sheet.open { transform: translateX(0); }
+        .disp-sheet h4 { font-size: 15px; font-weight: 800; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+        .disp-field { margin-bottom: 16px; }
+        .disp-field-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.07em; opacity: 0.5; margin-bottom: 7px; }
+        .disp-swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+        .disp-swatch {
+            height: 52px; border-radius: 11px; cursor: pointer; position: relative;
+            border: 2px solid rgba(255,255,255,0.16); overflow: hidden;
+            display: flex; align-items: flex-end; padding: 5px 7px;
+            font-size: 10px; font-weight: 800; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.7);
+        }
+        .disp-swatch.active { border-color: #fff; box-shadow: 0 0 0 2px rgba(255,255,255,0.35); }
+        .disp-sheet-row {
+            display: flex; align-items: center; gap: 10px; margin: 9px 0;
+            font-size: 13px; font-weight: 600; cursor: pointer; user-select: none;
+        }
+        .disp-sheet-row input[type="checkbox"] { width: 17px; height: 17px; margin: 0; accent-color: #818cf8; cursor: pointer; flex-shrink: 0; }
+        .disp-sheet input[type="time"] {
+            width: auto; margin: 0; padding: 7px 10px; font-size: 13px; font-family: inherit;
+            border-radius: 9px; border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.08); color: #fff;
+        }
+        .disp-sheet-btn {
+            width: 100%; margin: 0 0 8px; padding: 11px; border-radius: 11px; cursor: pointer;
+            font-size: 13px; font-weight: 700; font-family: inherit;
+            border: 1px solid rgba(255,255,255,0.22); background: rgba(255,255,255,0.09); color: #fff;
+        }
+        .disp-sheet-note { font-size: 11px; line-height: 1.5; opacity: 0.5; margin-top: 6px; }
+        .disp-sheet-warn { font-size: 11px; line-height: 1.5; margin-top: 8px; padding: 8px 10px; border-radius: 9px; background: rgba(245,158,11,0.16); border: 1px solid rgba(245,158,11,0.4); color: #fcd34d; }
+
+        /* ── Launcher card in the profile tab ── */
+        .disp-launch-btn {
+            width: 100%; padding: 13px; border-radius: 13px; cursor: pointer; margin: 0;
+            font-size: 14px; font-weight: 700; border: none; color: #fff;
+            background: linear-gradient(135deg, #0f172a, #334155);
+        }
     </style>
 </head>
 <body>
@@ -631,6 +802,7 @@
                 <div class="dropdown-item" onclick="event.stopPropagation();showTab('calendar')">📅 Calendar</div>
                 <div class="dropdown-item" onclick="event.stopPropagation();showTab('bookings')">📋 Bookings</div>
                 <div class="dropdown-item" id="nightModeToggle" onclick="event.stopPropagation();toggleNightMode()">🌙 Night Mode</div>
+                <div class="dropdown-item" onclick="event.stopPropagation();enterDisplayMode()">🖥️ Desk Display</div>
                 <div class="dropdown-separator"></div>
                 <div class="dropdown-item danger" onclick="event.stopPropagation();logout()">🚪 Log Out</div>
             </div>
@@ -724,6 +896,11 @@
 
             <!-- Reminder Settings — rendered by renderReminderSettingsSection() -->
             <div id="reminderSettingsSection"></div>
+
+            <div class="separator"></div>
+
+            <!-- Desk Display launcher — rendered by renderDisplaySettingsSection() -->
+            <div id="displaySettingsSection"></div>
 
             <div class="separator"></div>
 
@@ -843,6 +1020,40 @@
     <div style="text-align:center;margin-top:18px;">
         <button id="publicBottomBtn" class="btn-primary" onclick="window.location.href=window.location.pathname" style="width:auto;padding:13px 30px;">📅 Get Your Own Calendar</button>
     </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     DESK DISPLAY MODE
+     Full-screen ambient clock + today's remaining hours. Everything inside is
+     built by renderDisplayMode(); this is just the shell.
+══════════════════════════════════════ -->
+<div id="displayMode" class="hidden" onclick="revealDisplayControls()">
+    <div class="disp-wall" id="dispWall"></div>
+    <div class="disp-scrim"></div>
+
+    <div class="disp-shell" id="dispShell">
+        <div class="disp-clock">
+            <div class="disp-time" id="dispTime">--:--</div>
+            <div class="disp-date"    id="dispDate"></div>
+            <div class="disp-owner"   id="dispOwner"></div>
+            <div class="disp-next"    id="dispNext"></div>
+            <div class="disp-summary" id="dispSummary"></div>
+        </div>
+        <div class="disp-agenda">
+            <div class="disp-agenda-scroll" id="dispAgenda"></div>
+        </div>
+    </div>
+
+    <div class="disp-status" id="dispStatus"><span class="disp-status-dot"></span><span id="dispStatusText">Live</span></div>
+
+    <div class="disp-controls" id="dispControls">
+        <button class="disp-ctrl-btn" onclick="event.stopPropagation();toggleDisplaySheet()">⚙️ Look</button>
+        <button class="disp-ctrl-btn" onclick="event.stopPropagation();exitDisplayMode()">✕ Exit</button>
+    </div>
+
+    <!-- Settings sheet — rendered by renderDisplaySheet() so changes preview live -->
+    <div class="disp-sheet" id="dispSheet" onclick="event.stopPropagation()"></div>
+    <input type="file" id="dispWallpaperInput" accept="image/*" class="hidden" onchange="handleDisplayWallpaperUpload(this)">
 </div>
 
 <!-- ══════════════════════════════════════
@@ -1839,6 +2050,7 @@ function normalizePhoneNumber(phone) {
 }
 
 async function logout() {
+    exitDisplayMode({ skipHistoryBack: true });   // Drop the overlay, its timers and the wake lock
     stopBookingReminderLoop();      // Stop reminder interval before clearing user state
     // Unregister this device's background push BEFORE signing out (needs the session for
     // the RLS-gated delete) — otherwise the next user on this device would get my pushes.
@@ -2905,6 +3117,7 @@ function renderProfile() {
         renderFriends();
         renderRecentContactsSection();
         renderReminderSettingsSection(); // This already includes the notification badge
+        renderDisplaySettingsSection();
         renderMessageTemplatesSection();
 
         // Show contact import button only when the Contact Picker API is available
@@ -4992,6 +5205,15 @@ async function init() {
     const compareUid  = params.get('compare');
     const isEventLink = params.get('event');
     const addToCalgo  = params.get('add_Calgo');
+    const wantsDisplay = params.get('display') === '1';
+
+    // ?user=<id>&display=1 — a spare device pointed at someone's calendar with no login.
+    // Handled before the normal public-view route so the app UI never flashes up first.
+    if (wantsDisplay && targetUid) {
+        showLoadingOverlay('Loading display…');
+        await initDisplayLinkMode(targetUid, params.get('d') === '1');
+        return;
+    }
 
     if (addToCalgo) {
         Storage.setRaw('pending_add', { title: params.get('title'), dt: params.get('dt'), st: params.get('st'), en: params.get('en') });
@@ -5019,11 +5241,52 @@ async function init() {
 
     if (session && session.user && isRememberMeEnabled()) {
         await loadUserFromSession(session.user);
+        // ?display=1 on a signed-in device — boot straight into the desk display, so the
+        // bookmark on a dedicated device skips the app entirely.
+        if (wantsDisplay && currentUser) enterDisplayMode();
     } else {
         if (session && supabaseClient) await supabaseClient.auth.signOut();  // Remember-Me off -> no auto-restore
         hideLoadingOverlay();
         $('loginScreen').classList.remove('hidden');
     }
+}
+
+/**
+ * ?user=<id>&display=1 — desk display for someone's calendar with no sign-in.
+ * Works because blocks and bookings are public-read; without &d=1 busy hours are
+ * shown as plain "Busy", matching what a visitor sees in the normal public view.
+ * @param {string} targetUid
+ * @param {boolean} showLabels
+ */
+async function initDisplayLinkMode(targetUid, showLabels) {
+    let user = Storage.getUsers()[targetUid] || null;
+    try {
+        if (isSupabaseReady) {
+            const [fetchedUser, ownerBlocks, ownerBookings] = await Promise.all([
+                user ? Promise.resolve(user) : dbGetUser(targetUid),
+                dbGetBlocksByOwner(targetUid),
+                dbGetBookingsByOwner(targetUid)
+            ]);
+            user = fetchedUser || user;
+            const blockMap = {}; Storage.getBlocks().forEach(b => blockMap[b.id] = b);
+            ownerBlocks.forEach(b => blockMap[b.id] = b); Storage.setBlocks(Object.values(blockMap));
+            const bookingMap = {}; Storage.getBookings().forEach(b => bookingMap[b.id] = b);
+            ownerBookings.forEach(b => bookingMap[b.id] = b); Storage.setBookings(Object.values(bookingMap));
+            if (user) { const users = Storage.getUsers(); users[targetUid] = user; Storage.setUsers(users); }
+        }
+    } catch (e) {
+        // Offline or a failed fetch still shows the last data this device cached.
+        console.warn('Display link load failed:', e && e.message);
+    }
+
+    hideLoadingOverlay();
+    if (!user) {
+        showToast('❌ This calendar could not be found');
+        window.location.href = getBaseUrl();
+        return;
+    }
+    enterDisplayMode({ userId: targetUid, ownerName: user.name || '', linkMode: true, showLabels: !!showLabels });
+    if (!navigator.onLine) setDisplayOnlineStatus(false);
 }
 
 async function initWithTargetUser(targetUid) {
@@ -6059,6 +6322,732 @@ function initNotificationReminders() {
     }
 }
 
+
+/* ══════════════════════════════════════
+   FEATURE: DESK DISPLAY MODE
+   Turns any spare phone/tablet into an always-on Calgo desk display: a large
+   clock beside today's remaining hours. Two ways in —
+     · signed in  → 🖥️ Desk Display in the profile menu, or ?display=1
+     · no login   → ?user=<id>&display=1 (public-read data, "Busy" without labels
+                    unless the owner's link also carries &d=1)
+   Settings are DEVICE-LOCAL (fc_disp) and never synced: a wall tablet and a phone
+   want different looks, and a wallpaper must never reach the users row.
+══════════════════════════════════════ */
+
+const DISPLAY_SETTINGS_KEY = 'disp';
+
+const DISPLAY_DEFAULTS = {
+    theme:           'midnight',
+    wallpaper:       null,     // data-URL, downscaled — overrides the theme background
+    showSeconds:     false,
+    hour12:          true,
+    keepAwake:       true,
+    dimEnabled:      true,
+    dimStart:        '22:00',
+    dimEnd:          '06:00',
+    dimLevel:        0.35,
+    linkShowsLabels: false     // whether the generated display link carries &d=1
+};
+
+/** Built-in looks. `swatch` is what the settings grid paints; `bg` is the live background. */
+const DISPLAY_THEMES = [
+    { id:'midnight', name:'Midnight', bg:'linear-gradient(160deg,#0b1020 0%,#111a35 55%,#1b2450 100%)',
+      fg:'#f1f5f9', accent:'#818cf8', busyBg:'rgba(248,113,113,0.20)', busyFg:'#fecaca', freeBg:'rgba(255,255,255,0.05)' },
+    { id:'aurora',   name:'Aurora',   bg:'linear-gradient(135deg,#667eea 0%,#764ba2 50%,#f093fb 100%)',
+      fg:'#ffffff', accent:'#ffffff', busyBg:'rgba(0,0,0,0.30)',       busyFg:'#ffffff', freeBg:'rgba(255,255,255,0.13)' },
+    { id:'sand',     name:'Sand',     bg:'linear-gradient(160deg,#f7efdd 0%,#e6d5b8 100%)',
+      fg:'#3b2f1e', accent:'#b45309', busyBg:'rgba(180,83,9,0.18)',    busyFg:'#7c2d12', freeBg:'rgba(255,255,255,0.5)' },
+    { id:'forest',   name:'Forest',   bg:'linear-gradient(160deg,#08251c 0%,#0f3d2e 60%,#14532d 100%)',
+      fg:'#e7f5ee', accent:'#4ade80', busyBg:'rgba(250,204,21,0.18)',  busyFg:'#fde68a', freeBg:'rgba(255,255,255,0.06)' },
+    { id:'lamp',     name:'Warm Lamp',bg:'#0a0a0a',
+      fg:'#f5b642', accent:'#f59e0b', busyBg:'rgba(245,158,11,0.18)',  busyFg:'#fcd34d', freeBg:'rgba(255,255,255,0.04)' },
+    { id:'eink',     name:'E-Ink',    bg:'#ffffff',
+      fg:'#111827', accent:'#111827', busyBg:'#1f2937',                busyFg:'#ffffff', freeBg:'#f1f2f4' }
+];
+
+/** Wallpaper encoding budget. Above this we re-encode smaller rather than risk the quota. */
+const DISPLAY_WALLPAPER_MAX_EDGE  = 1600;
+const DISPLAY_WALLPAPER_MAX_BYTES = 700 * 1024;
+
+/** Burn-in drift — the whole shell nudges a few px each minute. */
+const DISPLAY_DRIFT_OFFSETS = [[0,0],[6,-4],[-5,5],[4,6],[-6,-5],[5,-6],[-4,4]];
+
+const DISPLAY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+/* ── Module state ── */
+let displayModeActive     = false;
+let displaySettingsCache  = null;
+let displayOwnerId        = null;
+let displayOwnerName      = '';
+let displayIsLinkMode     = false;
+let displayShowLabels     = true;
+let displayRowCount       = 0;
+let displayRenderedHour   = -1;
+let displayDriftIndex     = 0;
+let displayHistoryPushed  = false;
+let displayWasDarkReaderOn = false;
+let displayWakeLock       = null;
+let displayWakeLockError  = '';
+let displayClockTimer     = null;
+let displayMinuteTimer    = null;
+let displaySyncTimer      = null;
+let displayDriftTimer     = null;
+let displayControlsTimer  = null;
+
+/* ── Settings ── */
+
+/** Read display settings (cached — the clock re-reads these once a second). */
+function loadDisplaySettings() {
+    if (!displaySettingsCache) displaySettingsCache = { ...DISPLAY_DEFAULTS, ...(Storage.getRaw(DISPLAY_SETTINGS_KEY) || {}) };
+    return displaySettingsCache;
+}
+
+/**
+ * Merge a patch into the saved settings.
+ * A wallpaper can push localStorage over quota — bookings and blocks live in the same
+ * store, so a failed write must leave the previous settings intact, not half-applied.
+ * @returns {object|null} the saved settings, or null if the write was rejected
+ */
+function saveDisplaySettings(patch) {
+    const previous = loadDisplaySettings();
+    const next     = { ...previous, ...patch };
+    try {
+        Storage.setRaw(DISPLAY_SETTINGS_KEY, next);
+    } catch (e) {
+        displaySettingsCache = previous;
+        showToast('⚠️ Not enough space on this device to save that.');
+        return null;
+    }
+    displaySettingsCache = next;
+    return next;
+}
+
+function getDisplayTheme(themeId) {
+    return DISPLAY_THEMES.find(t => t.id === themeId) || DISPLAY_THEMES[0];
+}
+
+/* ── Data (pure) ── */
+
+/**
+ * Build the timeline rows for a display day: one entry per hour from `nowDate`'s hour
+ * to 23:00, so hours already gone simply aren't there.
+ * Pure — no DOM, no globals beyond the shared calendar queries — so it can be unit-tested.
+ * @param {string} dateStr  'YYYY-MM-DD'
+ * @param {string} userId
+ * @param {Date}   nowDate
+ * @param {{showLabels?:boolean, hour12?:boolean}} [opts]
+ * @returns {Array<{hour:number,timeLabel:string,state:string,label:string,isNow:boolean}>}
+ */
+function buildDisplayDayRows(dateStr, userId, nowDate, opts) {
+    const showLabels = !opts || opts.showLabels !== false;
+    const hour12     = !opts || opts.hour12     !== false;
+    const isToday    = dateStr === formatDateToISO(nowDate);
+    const firstHour  = isToday ? nowDate.getHours() : 0;
+
+    const blocks   = getBlocksForDate(dateStr, userId);
+    const bookings = [
+        ...getBookingsForDate(dateStr, userId, 'accepted'),
+        ...getBookingsForDate(dateStr, userId, 'pending')
+    ];
+    const covers = (item, hour) => hour >= parseTimeToHours(item.start) && hour < parseTimeToHours(item.end);
+
+    const rows = [];
+    for (let hour = firstHour; hour < 24; hour++) {
+        const block   = blocks.find(b   => covers(b, hour));
+        const booking = bookings.find(b => covers(b, hour));
+        let label = '';
+        if (block || booking) {
+            if (!showLabels)             label = 'Busy';
+            else if (block && block.label) label = block.label;
+            else if (booking)              label = booking.bookerName ? ('Booked · ' + booking.bookerName) : 'Booked';
+            else                           label = 'Busy';
+        }
+        rows.push({
+            hour,
+            timeLabel: hour12 ? formatTimeAmPm(hour) : (String(hour).padStart(2, '0') + ':00'),
+            state:     (block || booking) ? 'busy' : 'free',
+            label,
+            isNow:     isToday && hour === nowDate.getHours()
+        });
+    }
+    return rows;
+}
+
+/**
+ * What's happening now, or what's up next — using real start/end times rather than
+ * whole hours, so the countdown reads "in 25m" instead of "in 1h".
+ * @returns {{current:boolean,label:string,start:number,end?:number,minutesAway?:number}|null}
+ */
+function getDisplayNextItem(dateStr, userId, nowDate, showLabels) {
+    const nowHours = nowDate.getHours() + nowDate.getMinutes() / 60;
+    const items    = [];
+
+    getBlocksForDate(dateStr, userId).forEach(b => items.push({
+        start: parseTimeToHours(b.start),
+        end:   parseTimeToHours(b.end),
+        label: (showLabels && b.label) ? b.label : 'Busy'
+    }));
+    [...getBookingsForDate(dateStr, userId, 'accepted'), ...getBookingsForDate(dateStr, userId, 'pending')]
+        .forEach(b => items.push({
+            start: parseTimeToHours(b.start),
+            end:   parseTimeToHours(b.end),
+            label: (showLabels && b.bookerName) ? ('Booked · ' + b.bookerName) : 'Booked'
+        }));
+
+    items.sort((a, b) => a.start - b.start);
+
+    const current = items.find(i => nowHours >= i.start && nowHours < i.end);
+    if (current) return { current: true, label: current.label, start: current.start, end: current.end };
+
+    const next = items.find(i => i.start > nowHours);
+    if (!next) return null;
+    return { current: false, label: next.label, start: next.start, minutesAway: Math.round((next.start - nowHours) * 60) };
+}
+
+/** "1h 20m" / "25m" */
+function formatDisplayGap(totalMinutes) {
+    if (totalMinutes < 1)  return 'now';
+    if (totalMinutes < 60) return totalMinutes + 'm';
+    const hours   = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+/** Fractional hours → a label matching the user's 12/24h choice. */
+function formatDisplayHourValue(value, hour12) {
+    const hour   = Math.floor(value);
+    const minute = Math.round((value - hour) * 60);
+    return hour12 ? formatTimeAmPm(hour, minute)
+                  : String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
+}
+
+/* ── Rendering ── */
+
+function applyDisplayTheme() {
+    const root = $('displayMode');
+    if (!root) return;
+    const settings = loadDisplaySettings();
+    const theme    = getDisplayTheme(settings.theme);
+    const wall     = $('dispWall');
+
+    root.style.setProperty('--disp-fg',      theme.fg);
+    root.style.setProperty('--disp-accent',  theme.accent);
+    root.style.setProperty('--disp-busy-bg', theme.busyBg);
+    root.style.setProperty('--disp-busy-fg', theme.busyFg);
+    root.style.setProperty('--disp-free-bg', theme.freeBg);
+    root.style.setProperty('--disp-dim',     String(settings.dimLevel));
+
+    if (wall) wall.style.background = settings.wallpaper ? `url("${settings.wallpaper}") center/cover no-repeat` : theme.bg;
+    root.classList.toggle('has-photo', !!settings.wallpaper);
+}
+
+function renderDisplayClock() {
+    const timeEl = $('dispTime');
+    if (!timeEl) return;
+    const settings = loadDisplaySettings();
+    const now      = new Date();
+    const hour24   = now.getHours();
+    const shown    = settings.hour12 ? (hour24 % 12 || 12) : hour24;
+
+    let html = (settings.hour12 ? String(shown) : String(shown).padStart(2, '0'))
+             + ':' + String(now.getMinutes()).padStart(2, '0');
+    if (settings.showSeconds) html += `<span class="disp-secs">${String(now.getSeconds()).padStart(2, '0')}</span>`;
+    if (settings.hour12)      html += `<span class="disp-ampm">${hour24 >= 12 ? 'PM' : 'AM'}</span>`;
+    timeEl.innerHTML = html;
+
+    const dateEl = $('dispDate');
+    if (dateEl) dateEl.textContent = now.toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
+}
+
+/** Redraw the timeline, the "now/next" line and the summary. Cheap enough to run every minute. */
+function renderDisplayAgenda() {
+    const listEl = $('dispAgenda');
+    if (!listEl || !displayOwnerId) return;
+
+    const settings = loadDisplaySettings();
+    const now      = new Date();
+    const dateStr  = formatDateToISO(now);
+    const rows     = buildDisplayDayRows(dateStr, displayOwnerId, now, {
+        showLabels: displayShowLabels,
+        hour12:     settings.hour12
+    });
+
+    displayRowCount     = rows.length;
+    displayRenderedHour = now.getHours();
+
+    if (!rows.length) {
+        listEl.innerHTML = `<div class="disp-empty"><div class="disp-empty-icon">🌙</div>
+            <div class="disp-empty-text">Day's done</div>
+            <div class="disp-empty-sub">Nothing left on the calendar</div></div>`;
+    } else {
+        listEl.innerHTML = rows.map(row => {
+            const classes = 'disp-row ' + row.state + (row.isNow ? ' now' : '');
+            const text    = row.state === 'busy' ? ('⛔ ' + escapeHtml(row.label || 'Busy')) : 'Free';
+            return `<div class="${classes}"><span class="disp-row-time">${escapeHtml(row.timeLabel)}</span><span class="disp-row-text">${text}</span></div>`;
+        }).join('');
+    }
+
+    // Now / next
+    const nextEl = $('dispNext');
+    if (nextEl) {
+        const item = getDisplayNextItem(dateStr, displayOwnerId, now, displayShowLabels);
+        if (!item) {
+            nextEl.innerHTML = `<div class="disp-next-label">Rest of today</div><div class="disp-next-text">Nothing scheduled ☀️</div>`;
+        } else if (item.current) {
+            nextEl.innerHTML = `<div class="disp-next-label">Now</div>
+                <div class="disp-next-text">${escapeHtml(item.label)}</div>
+                <div class="disp-next-when">until ${escapeHtml(formatDisplayHourValue(item.end, settings.hour12))}</div>`;
+        } else {
+            nextEl.innerHTML = `<div class="disp-next-label">Next</div>
+                <div class="disp-next-text">${escapeHtml(item.label)}</div>
+                <div class="disp-next-when">${escapeHtml(formatDisplayHourValue(item.start, settings.hour12))} · in ${escapeHtml(formatDisplayGap(item.minutesAway))}</div>`;
+        }
+    }
+
+    const summaryEl = $('dispSummary');
+    if (summaryEl) {
+        const busy = rows.filter(r => r.state === 'busy').length;
+        summaryEl.textContent = rows.length
+            ? `${busy} busy · ${rows.length - busy} free — rest of today`
+            : '';
+    }
+
+    fitDisplayLayout();
+}
+
+/**
+ * Size the clock and the timeline rows to the space actually available, so the display
+ * never scrolls: 18 rows at 6am shrink, 3 rows at 9pm grow.
+ * The clock is measured at a probe size and scaled, which works on any font/zoom.
+ */
+function fitDisplayLayout() {
+    const root = $('displayMode');
+    if (!root || root.classList.contains('hidden')) return;
+
+    const timeEl  = $('dispTime');
+    const clockEl = timeEl && timeEl.parentElement;
+    if (timeEl && clockEl && clockEl.clientWidth > 0 && clockEl.clientHeight > 0) {
+        const PROBE = 100;
+        root.style.setProperty('--disp-clock-size', PROBE + 'px');
+        const probeWidth = timeEl.scrollWidth || 1;   // reading this forces the reflow we need
+        let size = PROBE * (clockEl.clientWidth * 0.98) / probeWidth;
+        size = Math.min(size, clockEl.clientHeight * 0.46);
+        size = Math.max(34, Math.min(size, 260));
+        root.style.setProperty('--disp-clock-size', Math.floor(size) + 'px');
+    }
+
+    const listEl = $('dispAgenda');
+    if (listEl && displayRowCount > 0 && listEl.clientHeight > 0) {
+        const gap       = Math.max(3, Math.round(listEl.clientHeight * 0.008));
+        const available = listEl.clientHeight - gap * (displayRowCount - 1);
+        const height    = Math.max(26, Math.min(Math.floor(available / displayRowCount), 110));
+        root.style.setProperty('--disp-row-h',   height + 'px');
+        root.style.setProperty('--disp-row-gap', gap + 'px');
+    }
+}
+
+function driftDisplayLayout() {
+    const shell = $('dispShell');
+    if (!shell) return;
+    displayDriftIndex = (displayDriftIndex + 1) % DISPLAY_DRIFT_OFFSETS.length;
+    const [x, y] = DISPLAY_DRIFT_OFFSETS[displayDriftIndex];
+    shell.style.transform = `translate(${x}px, ${y}px)`;
+}
+
+/** Is `now` inside the dim window? Handles windows that cross midnight (22:00 → 06:00). */
+function isWithinDisplayDimWindow(settings, now) {
+    if (!settings.dimEnabled) return false;
+    const toMinutes = t => {
+        const [h, m] = String(t || '00:00').split(':').map(Number);
+        return (h || 0) * 60 + (m || 0);
+    };
+    const current = now.getHours() * 60 + now.getMinutes();
+    const start   = toMinutes(settings.dimStart);
+    const end     = toMinutes(settings.dimEnd);
+    if (start === end) return false;
+    return start < end ? (current >= start && current < end) : (current >= start || current < end);
+}
+
+function applyDisplayDim() {
+    const root = $('displayMode');
+    if (!root) return;
+    root.classList.toggle('dimmed', isWithinDisplayDimWindow(loadDisplaySettings(), new Date()));
+}
+
+function setDisplayOnlineStatus(isOnline) {
+    const statusEl = $('dispStatus'), textEl = $('dispStatusText');
+    if (!statusEl || !textEl) return;
+    statusEl.classList.toggle('offline', !isOnline);
+    textEl.textContent = isOnline ? 'Live' : 'Offline';
+}
+
+/* ── Controls & settings sheet ── */
+
+/** Tapping the screen shows the controls for a few seconds — it never exits, so a
+ *  brushed screen can't knock the display off. */
+function revealDisplayControls() {
+    const controls = $('dispControls');
+    if (!controls) return;
+    controls.classList.add('show');
+    clearTimeout(displayControlsTimer);
+    displayControlsTimer = setTimeout(() => controls.classList.remove('show'), 4000);
+}
+
+function toggleDisplaySheet() {
+    const sheet = $('dispSheet');
+    if (!sheet) return;
+    const opening = !sheet.classList.contains('open');
+    sheet.classList.toggle('open', opening);
+    if (opening) renderDisplaySheet();
+    // The sheet covers the agenda in landscape — re-fit once it has finished sliding.
+    setTimeout(fitDisplayLayout, 320);
+}
+
+function renderDisplaySheet() {
+    const sheet = $('dispSheet');
+    if (!sheet) return;
+    const settings = loadDisplaySettings();
+
+    const swatches = DISPLAY_THEMES.map(theme => `
+        <div class="disp-swatch ${settings.theme === theme.id ? 'active' : ''}"
+             style="background:${theme.bg};color:${theme.id === 'eink' || theme.id === 'sand' ? '#1f2937' : '#fff'};text-shadow:none;"
+             onclick="setDisplayTheme('${theme.id}')">${escapeHtml(theme.name)}</div>`).join('');
+
+    sheet.innerHTML = `
+        <h4>⚙️ Display Look <button class="disp-ctrl-btn" style="margin-left:auto;padding:6px 12px;font-size:12px;" onclick="toggleDisplaySheet()">Done</button></h4>
+
+        <div class="disp-field">
+            <div class="disp-field-label">Theme</div>
+            <div class="disp-swatches">${swatches}</div>
+        </div>
+
+        <div class="disp-field">
+            <div class="disp-field-label">Wallpaper</div>
+            <button class="disp-sheet-btn" onclick="$('dispWallpaperInput').click()">🖼️ ${settings.wallpaper ? 'Change photo' : 'Choose a photo'}</button>
+            ${settings.wallpaper ? `<button class="disp-sheet-btn" onclick="clearDisplayWallpaper()">✕ Remove photo</button>` : ''}
+            <div class="disp-sheet-note">Photos are shrunk before saving and stay on this device only — they are never uploaded.</div>
+        </div>
+
+        <div class="disp-field">
+            <div class="disp-field-label">Clock</div>
+            <label class="disp-sheet-row"><input type="checkbox" ${settings.showSeconds ? 'checked' : ''} onchange="updateDisplaySetting('showSeconds', this.checked)"> Show seconds</label>
+            <label class="disp-sheet-row"><input type="checkbox" ${settings.hour12 ? 'checked' : ''} onchange="updateDisplaySetting('hour12', this.checked)"> 12-hour time (AM/PM)</label>
+        </div>
+
+        <div class="disp-field">
+            <div class="disp-field-label">Screen</div>
+            <label class="disp-sheet-row"><input type="checkbox" ${settings.keepAwake ? 'checked' : ''} onchange="updateDisplaySetting('keepAwake', this.checked)"> Keep the screen awake</label>
+            ${displayWakeLockError ? `<div class="disp-sheet-warn">⚠️ ${escapeHtml(displayWakeLockError)}</div>` : ''}
+            <label class="disp-sheet-row"><input type="checkbox" ${settings.dimEnabled ? 'checked' : ''} onchange="updateDisplaySetting('dimEnabled', this.checked)"> Dim at night</label>
+            ${settings.dimEnabled ? `
+            <div class="disp-sheet-row" style="cursor:default;gap:8px;flex-wrap:wrap;">
+                <span style="opacity:0.6;">from</span>
+                <input type="time" value="${settings.dimStart}" onchange="updateDisplaySetting('dimStart', this.value)">
+                <span style="opacity:0.6;">to</span>
+                <input type="time" value="${settings.dimEnd}" onchange="updateDisplaySetting('dimEnd', this.value)">
+            </div>` : ''}
+        </div>
+
+        <div class="disp-sheet-note">The screen shifts a few pixels every minute — that is deliberate, it protects an OLED panel from burn-in.</div>`;
+}
+
+function setDisplayTheme(themeId) {
+    if (!saveDisplaySettings({ theme: themeId })) return;
+    applyDisplayTheme();
+    renderDisplaySheet();
+}
+
+/** Apply one setting and refresh whatever it affects. */
+function updateDisplaySetting(key, value) {
+    if (!saveDisplaySettings({ [key]: value })) return;
+    if (key === 'keepAwake') {
+        if (value) requestDisplayWakeLock(); else releaseDisplayWakeLock();
+    }
+    if (key === 'dimEnabled' || key === 'dimStart' || key === 'dimEnd') applyDisplayDim();
+    applyDisplayTheme();
+    renderDisplayClock();
+    renderDisplayAgenda();
+    renderDisplaySheet();
+    if ($('displaySettingsSection')) renderDisplaySettingsSection();
+}
+
+/* ── Wallpaper ── */
+
+/**
+ * Downscale + JPEG-encode the chosen photo before it goes anywhere near localStorage.
+ * A raw phone photo as a data-URL is several MB and would blow the quota that also
+ * holds bookings and blocks.
+ */
+function handleDisplayWallpaperUpload(inputEl) {
+    const file = inputEl.files && inputEl.files[0];
+    inputEl.value = '';                       // let the same file be re-picked later
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onerror = () => showToast('⚠️ Could not read that image.');
+    reader.onload  = e => {
+        const image = new Image();
+        image.onerror = () => showToast('⚠️ That file is not an image Calgo can read.');
+        image.onload  = () => {
+            let dataUrl = encodeDisplayWallpaper(image, DISPLAY_WALLPAPER_MAX_EDGE, 0.72);
+            if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 1200, 0.6);
+            if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 900, 0.5);
+            if (!saveDisplaySettings({ wallpaper: dataUrl })) return;
+            applyDisplayTheme();
+            renderDisplaySheet();
+            showToast('🖼️ Wallpaper set');
+        };
+        image.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+}
+
+/** Draw the image onto a canvas capped at `maxEdge` and return a JPEG data-URL. */
+function encodeDisplayWallpaper(image, maxEdge, quality) {
+    const scale  = Math.min(1, maxEdge / Math.max(image.width || 1, image.height || 1));
+    const canvas = document.createElement('canvas');
+    canvas.width  = Math.max(1, Math.round((image.width  || 1) * scale));
+    canvas.height = Math.max(1, Math.round((image.height || 1) * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality);
+}
+
+function clearDisplayWallpaper() {
+    if (!saveDisplaySettings({ wallpaper: null })) return;
+    applyDisplayTheme();
+    renderDisplaySheet();
+    showToast('🖼️ Wallpaper removed');
+}
+
+/* ── Keeping the screen on ── */
+
+/**
+ * Ask for a screen wake lock. The browser silently drops it whenever the tab is
+ * backgrounded and never restores it, so this is called again on every
+ * visibilitychange while the display is up.
+ */
+async function requestDisplayWakeLock() {
+    if (!displayModeActive || !loadDisplaySettings().keepAwake) return;
+    if (displayWakeLock) return;
+    if (!('wakeLock' in navigator)) {
+        displayWakeLockError = "This browser can't hold the screen on — set the device's screen timeout to Never.";
+        return;
+    }
+    try {
+        displayWakeLock = await navigator.wakeLock.request('screen');
+        displayWakeLockError = '';
+        displayWakeLock.addEventListener('release', () => { displayWakeLock = null; });
+    } catch (e) {
+        displayWakeLock = null;
+        displayWakeLockError = 'The screen-on request was refused (' + (e.name || 'error') + ") — set the device's screen timeout to Never.";
+    }
+}
+
+function releaseDisplayWakeLock() {
+    if (!displayWakeLock) return;
+    try { displayWakeLock.release(); } catch (e) { /* already gone */ }
+    displayWakeLock = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (!displayModeActive || document.visibilityState !== 'visible') return;
+    requestDisplayWakeLock();
+    renderDisplayClock();
+    renderDisplayAgenda();   // a backgrounded tab is throttled; catch up on return
+    applyDisplayDim();
+});
+
+/* ── Data refresh ── */
+
+async function syncDisplayData() {
+    if (!displayOwnerId) return;
+    try {
+        if (displayIsLinkMode) {
+            if (!isSupabaseReady) { setDisplayOnlineStatus(false); return; }
+            const [blocks, bookings] = await Promise.all([
+                dbGetBlocksByOwner(displayOwnerId),
+                dbGetBookingsByOwner(displayOwnerId)
+            ]);
+            const blockMap = {}; Storage.getBlocks().forEach(b => blockMap[b.id] = b);
+            blocks.forEach(b => blockMap[b.id] = b); Storage.setBlocks(Object.values(blockMap));
+            const bookingMap = {}; Storage.getBookings().forEach(b => bookingMap[b.id] = b);
+            bookings.forEach(b => bookingMap[b.id] = b); Storage.setBookings(Object.values(bookingMap));
+        } else {
+            await syncCurrentUserData({ silent: true });
+        }
+        setDisplayOnlineStatus(navigator.onLine !== false);
+    } catch (e) {
+        setDisplayOnlineStatus(false);
+    }
+    renderDisplayAgenda();
+}
+
+/* ── Enter / exit ── */
+
+/**
+ * Show the display overlay.
+ * @param {{userId?:string, ownerName?:string, linkMode?:boolean, showLabels?:boolean}} [opts]
+ */
+function enterDisplayMode(opts) {
+    const options = opts || {};
+    const ownerId = options.userId || (currentUser && currentUser.id);
+    if (!ownerId) { showToast('⚠️ Sign in first to use the desk display.'); return; }
+    if (displayModeActive) return;
+
+    $('profileDropdown')?.classList.remove('open');
+
+    displayModeActive   = true;
+    displayOwnerId      = ownerId;
+    displayIsLinkMode   = !!options.linkMode;
+    displayShowLabels   = options.showLabels !== false;
+    displayOwnerName    = options.ownerName || (currentUser && currentUser.id === ownerId ? (currentUser.name || '') : '');
+    displayWakeLockError = '';
+
+    // Night mode is DarkReader rewriting the page at runtime — it would invert the
+    // wallpaper and every theme colour. Same disable/restore dance as the JPG export.
+    displayWasDarkReaderOn = (typeof DarkReader !== 'undefined') && DarkReader.isEnabled();
+    if (displayWasDarkReaderOn) { try { DarkReader.disable(); } catch (e) {} }
+
+    const ownerEl = $('dispOwner');
+    if (ownerEl) ownerEl.textContent = displayOwnerName ? displayOwnerName + "'s calendar" : '';
+
+    const root = $('displayMode');
+    root.classList.remove('hidden');
+    document.body.classList.add('disp-open');
+    $('dispSheet')?.classList.remove('open');
+
+    applyDisplayTheme();
+    applyDisplayDim();
+    renderDisplayClock();
+    renderDisplayAgenda();
+    revealDisplayControls();
+
+    // Android's back button should leave the display, not the app.
+    try { history.pushState({ calgoDisplay: true }, '', location.href); displayHistoryPushed = true; } catch (e) {}
+
+    // Chromeless where the API allows it; an installed PWA is already chromeless.
+    try {
+        const request = document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen;
+        if (request) Promise.resolve(request.call(document.documentElement)).catch(() => {});
+    } catch (e) {}
+
+    requestDisplayWakeLock();
+
+    displayClockTimer  = setInterval(renderDisplayClock, 1000);
+    // Redrawn every minute: the timeline only changes on the hour, but the "in 25m"
+    // countdown next to it changes every minute.
+    displayMinuteTimer = setInterval(() => { applyDisplayDim(); renderDisplayAgenda(); }, 60000);
+    displaySyncTimer  = setInterval(syncDisplayData, DISPLAY_SYNC_INTERVAL_MS);
+    displayDriftTimer = setInterval(driftDisplayLayout, 60000);
+
+    window.addEventListener('resize', fitDisplayLayout);
+    window.addEventListener('orientationchange', fitDisplayLayout);
+
+    syncDisplayData();
+}
+
+/** Tear the overlay down and put every timer, lock and theme back the way it was. */
+function exitDisplayMode(opts) {
+    if (!displayModeActive) return;
+    displayModeActive = false;
+
+    clearInterval(displayClockTimer);  displayClockTimer  = null;
+    clearInterval(displayMinuteTimer); displayMinuteTimer = null;
+    clearInterval(displaySyncTimer);   displaySyncTimer   = null;
+    clearInterval(displayDriftTimer);  displayDriftTimer  = null;
+    clearTimeout(displayControlsTimer); displayControlsTimer = null;
+
+    window.removeEventListener('resize', fitDisplayLayout);
+    window.removeEventListener('orientationchange', fitDisplayLayout);
+
+    releaseDisplayWakeLock();
+
+    const root = $('displayMode');
+    if (root) {
+        root.classList.add('hidden');
+        root.classList.remove('dimmed');
+    }
+    document.body.classList.remove('disp-open');
+    $('dispSheet')?.classList.remove('open');
+    $('dispControls')?.classList.remove('show');
+
+    try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen(); } catch (e) {}
+
+    if (displayWasDarkReaderOn) {
+        try { DarkReader.enable(NIGHT_MODE_THEME); } catch (e) {}
+        displayWasDarkReaderOn = false;
+    }
+
+    // A link-mode display has no app behind it — drop the display flags and show the
+    // normal public calendar instead of leaving a blank page.
+    if (displayIsLinkMode) {
+        window.location.href = getBaseUrl() + '?user=' + encodeURIComponent(displayOwnerId);
+        return;
+    }
+
+    // Pop the pushed entry so the back stack is clean again — unless the caller is
+    // popstate itself (already popped) or logout (about to navigate away anyway).
+    const skipHistoryBack = !!(opts && opts.skipHistoryBack);
+    if (!skipHistoryBack && displayHistoryPushed) { try { history.back(); } catch (e) {} }
+    displayHistoryPushed = false;
+}
+
+window.addEventListener('popstate', () => { if (displayModeActive) exitDisplayMode({ skipHistoryBack: true }); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && displayModeActive) exitDisplayMode(); });
+window.addEventListener('online',  () => { if (displayModeActive) syncDisplayData(); });
+window.addEventListener('offline', () => { if (displayModeActive) setDisplayOnlineStatus(false); });
+
+/* ── Profile launcher card ── */
+
+/** The link an old phone can be pointed at without ever signing in. */
+function buildDisplayLinkUrl() {
+    if (!currentUser) return '';
+    return getBaseUrl() + '?user=' + encodeURIComponent(currentUser.id) + '&display=1'
+         + (loadDisplaySettings().linkShowsLabels ? '&d=1' : '');
+}
+
+function copyDisplayLink() {
+    const input = $('displayLinkInput');
+    if (!input) return;
+    input.select();
+    navigator.clipboard?.writeText(input.value)
+        .then(() => showToast('📋 Display link copied'))
+        .catch(() => showToast('📋 Select and copy the link above'));
+}
+
+function renderDisplaySettingsSection() {
+    const container = $('displaySettingsSection');
+    if (!container || !currentUser) return;
+    const settings = loadDisplaySettings();
+
+    container.innerHTML = `
+        <div style="font-size:15px;font-weight:700;margin-bottom:8px;">🖥️ Desk Display</div>
+        <p style="font-size:12px;color:var(--text-light);margin-bottom:12px;line-height:1.6;">
+            Turn this device — or a spare phone or tablet — into an always-on desk clock showing
+            what is left of today. Choose the look from inside the display.
+        </p>
+        <button class="disp-launch-btn" onclick="enterDisplayMode()">▶ Start Desk Display</button>
+
+        <div class="reminder-sub-setting" style="margin-top:12px;">
+            <div style="margin-bottom:6px;font-weight:600;color:var(--text);">Use a spare device without signing in</div>
+            <div>Open this link on the other device and bookmark it, or add it to its home screen.</div>
+            <div class="share-link-row" style="margin-top:8px;">
+                <input type="text" id="displayLinkInput" readonly value="${escapeHtml(buildDisplayLinkUrl())}">
+                <button class="btn-primary" onclick="copyDisplayLink()" style="width:auto;padding:11px 18px;">📋 Copy</button>
+            </div>
+            <label class="reminder-toggle-row" style="font-size:12px;">
+                <input type="checkbox" ${settings.linkShowsLabels ? 'checked' : ''}
+                    onchange="updateDisplaySetting('linkShowsLabels', this.checked)">
+                Show slot labels on this link
+            </label>
+            <div style="font-size:11px;line-height:1.5;">
+                ${settings.linkShowsLabels
+                    ? '⚠️ Anyone who opens this link sees what each busy slot is called. Leave it off to show only “Busy”.'
+                    : 'Busy hours show as “Busy” with no details. Turn this on to see your own slot labels on the display.'}
+            </div>
+        </div>`;
+}
 
 /* ══════════════════════════════════════
    FEATURE: LOADING OVERLAY
