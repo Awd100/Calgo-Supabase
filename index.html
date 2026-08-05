@@ -554,6 +554,13 @@
             .profile-dropdown { right: -10px; }
         }
 
+        /* Landscape phone: wide enough to miss the max-width:600px rules above, but far
+           too short to centre a tall modal. Keep modals reachable when the app rotates. */
+        @media (max-height: 520px) {
+            .modal-overlay { align-items: flex-start; padding-top: 12px; padding-bottom: 12px; }
+            .modal { max-height: 94vh; }
+        }
+
         /* ══════════════════════════════════════
            DESK DISPLAY MODE
            A full-screen ambient clock + today's remaining hours, for leaving an
@@ -622,10 +629,19 @@
 
         /* ── Agenda pane ── */
         .disp-agenda { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
-        .disp-agenda-scroll { display: flex; flex-direction: column; gap: var(--disp-row-gap, 5px); overflow-y: auto; flex: 1; min-height: 0; }
+        /* Column-flow grid: rows run top-to-bottom, then wrap into a second (or third)
+           column. fitDisplayLayout() decides how many, so a short landscape phone shows
+           every remaining hour side by side instead of scrolling. */
+        .disp-agenda-scroll {
+            display: grid; grid-auto-flow: column;
+            grid-template-rows: repeat(var(--disp-rows-per-col, 24), var(--disp-row-h, 44px));
+            grid-auto-columns: minmax(0, 1fr);
+            gap: var(--disp-row-gap, 5px); align-content: start;
+            overflow-y: auto; flex: 1; min-height: 0;
+        }
         .disp-row {
             display: flex; align-items: center; gap: clamp(8px, 1.6vmin, 18px);
-            height: var(--disp-row-h, 44px); flex: 0 0 var(--disp-row-h, 44px);
+            height: var(--disp-row-h, 44px); min-width: 0;
             padding: 0 clamp(8px, 1.6vmin, 18px);
             border-radius: clamp(8px, 1.2vmin, 16px);
             font-size: calc(var(--disp-row-h, 44px) * 0.36);
@@ -644,7 +660,8 @@
            busy foreground instead so the current hour is obvious in every theme. */
         .disp-row.now.busy { border-color: var(--disp-busy-fg, #fecaca); box-shadow: 0 0 0 1px var(--disp-busy-fg, #fecaca); }
         .disp-empty {
-            flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            grid-column: 1 / -1; grid-row: 1 / -1;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
             text-align: center; gap: 0.4em; opacity: 0.75;
         }
         .disp-empty-icon { font-size: clamp(40px, 11vmin, 110px); }
@@ -6339,6 +6356,7 @@ const DISPLAY_SETTINGS_KEY = 'disp';
 const DISPLAY_DEFAULTS = {
     theme:           'midnight',
     wallpaper:       null,     // data-URL, downscaled — overrides the theme background
+    wallpaperFit:    'cover',  // 'cover' = fill and crop · 'contain' = whole photo, theme behind
     showSeconds:     false,
     hour12:          true,
     keepAwake:       true,
@@ -6374,6 +6392,15 @@ const DISPLAY_DRIFT_OFFSETS = [[0,0],[6,-4],[-5,5],[4,6],[-6,-5],[5,-6],[-4,4]];
 
 const DISPLAY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
+/* Column-splitting guards. A single column is always preferred, because a narrow column
+ * truncates the slot label to uselessness ("Pr…"). Splitting only happens when BOTH are
+ * true: one column would push rows under the legibility floor, AND the resulting columns
+ * are still wide enough to say something. That keeps an upright phone (tall, narrow) on
+ * one column and rescues a landscape phone (short, wide), where 18 rows can't otherwise fit. */
+const DISPLAY_MIN_ROW_HEIGHT      = 24;
+const DISPLAY_MIN_COLUMN_WIDTH    = 200;
+const DISPLAY_MAX_AGENDA_COLUMNS  = 3;
+
 /* ── Module state ── */
 let displayModeActive     = false;
 let displaySettingsCache  = null;
@@ -6393,6 +6420,7 @@ let displayMinuteTimer    = null;
 let displaySyncTimer      = null;
 let displayDriftTimer     = null;
 let displayControlsTimer  = null;
+let displayRefitTimer     = null;
 
 /* ── Settings ── */
 
@@ -6537,7 +6565,14 @@ function applyDisplayTheme() {
     root.style.setProperty('--disp-free-bg', theme.freeBg);
     root.style.setProperty('--disp-dim',     String(settings.dimLevel));
 
-    if (wall) wall.style.background = settings.wallpaper ? `url("${settings.wallpaper}") center/cover no-repeat` : theme.bg;
+    // 'contain' letterboxes a photo whose shape doesn't match the screen — a landscape
+    // wallpaper on an upright phone — and paints the theme behind it rather than bare black.
+    if (wall) {
+        const fit = settings.wallpaperFit === 'contain' ? 'contain' : 'cover';
+        wall.style.background = settings.wallpaper
+            ? `url("${settings.wallpaper}") center/${fit} no-repeat, ${theme.bg}`
+            : theme.bg;
+    }
     root.classList.toggle('has-photo', !!settings.wallpaper);
 }
 
@@ -6576,6 +6611,7 @@ function renderDisplayAgenda() {
     displayRenderedHour = now.getHours();
 
     if (!rows.length) {
+        $('displayMode')?.style.setProperty('--disp-rows-per-col', '1');
         listEl.innerHTML = `<div class="disp-empty"><div class="disp-empty-icon">🌙</div>
             <div class="disp-empty-text">Day's done</div>
             <div class="disp-empty-sub">Nothing left on the calendar</div></div>`;
@@ -6638,12 +6674,34 @@ function fitDisplayLayout() {
 
     const listEl = $('dispAgenda');
     if (listEl && displayRowCount > 0 && listEl.clientHeight > 0) {
-        const gap       = Math.max(3, Math.round(listEl.clientHeight * 0.008));
-        const available = listEl.clientHeight - gap * (displayRowCount - 1);
-        const height    = Math.max(26, Math.min(Math.floor(available / displayRowCount), 110));
-        root.style.setProperty('--disp-row-h',   height + 'px');
-        root.style.setProperty('--disp-row-gap', gap + 'px');
+        const gap = Math.max(3, Math.round(listEl.clientHeight * 0.008));
+        const heightFor      = perColumn => Math.floor((listEl.clientHeight - gap * (perColumn - 1)) / perColumn);
+        const columnWidthFor = count      => (listEl.clientWidth - gap * (count - 1)) / count;
+
+        // Prefer one column; add one only while rows are still too short AND the extra
+        // column would leave enough room to read a label.
+        let columns = 1;
+        while (columns < DISPLAY_MAX_AGENDA_COLUMNS
+               && heightFor(Math.ceil(displayRowCount / columns)) < DISPLAY_MIN_ROW_HEIGHT
+               && columnWidthFor(columns + 1) >= DISPLAY_MIN_COLUMN_WIDTH) columns++;
+
+        const perColumn = Math.ceil(displayRowCount / columns);
+        const height    = Math.max(DISPLAY_MIN_ROW_HEIGHT, Math.min(heightFor(perColumn), 110));
+        root.style.setProperty('--disp-rows-per-col', String(perColumn));
+        root.style.setProperty('--disp-row-h',        height + 'px');
+        root.style.setProperty('--disp-row-gap',      gap + 'px');
     }
+}
+
+/**
+ * Re-fit now and again shortly after. On a rotation, resize/orientationchange often fire
+ * before the new viewport size is readable, so a single immediate pass measures the OLD
+ * box and leaves the clock the wrong size until something else nudges it.
+ */
+function scheduleDisplayRefit() {
+    fitDisplayLayout();
+    clearTimeout(displayRefitTimer);
+    displayRefitTimer = setTimeout(fitDisplayLayout, 260);
 }
 
 function driftDisplayLayout() {
@@ -6724,8 +6782,15 @@ function renderDisplaySheet() {
         <div class="disp-field">
             <div class="disp-field-label">Wallpaper</div>
             <button class="disp-sheet-btn" onclick="$('dispWallpaperInput').click()">🖼️ ${settings.wallpaper ? 'Change photo' : 'Choose a photo'}</button>
-            ${settings.wallpaper ? `<button class="disp-sheet-btn" onclick="clearDisplayWallpaper()">✕ Remove photo</button>` : ''}
-            <div class="disp-sheet-note">Photos are shrunk before saving and stay on this device only — they are never uploaded.</div>
+            ${settings.wallpaper ? `
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                <button class="disp-sheet-btn" style="margin:0;${settings.wallpaperFit !== 'contain' ? 'border-color:#fff;background:rgba(255,255,255,0.2);' : ''}"
+                    onclick="updateDisplaySetting('wallpaperFit','cover')">Fill screen</button>
+                <button class="disp-sheet-btn" style="margin:0;${settings.wallpaperFit === 'contain' ? 'border-color:#fff;background:rgba(255,255,255,0.2);' : ''}"
+                    onclick="updateDisplaySetting('wallpaperFit','contain')">Whole photo</button>
+            </div>
+            <button class="disp-sheet-btn" onclick="clearDisplayWallpaper()">✕ Remove photo</button>` : ''}
+            <div class="disp-sheet-note">Photos are shrunk before saving and stay on this device only — they are never uploaded.${settings.wallpaper ? ' “Fill screen” crops a wide photo on an upright screen; “Whole photo” shows all of it with the theme behind.' : ''}</div>
         </div>
 
         <div class="disp-field">
@@ -6850,6 +6915,25 @@ function releaseDisplayWakeLock() {
     displayWakeLock = null;
 }
 
+/**
+ * Let the desk display rotate even when the installed app is pinned to one orientation.
+ * The manifest now says "any", but an app installed from an older manifest keeps the old
+ * value until Chrome refreshes it, so this overrides it at runtime. Harmless when the
+ * manifest already allows rotation, and silently ignored where the API is missing.
+ */
+function releaseDisplayOrientationLock() {
+    try {
+        if (screen.orientation && screen.orientation.lock) {
+            Promise.resolve(screen.orientation.lock('any')).catch(() => {});
+        }
+    } catch (e) { /* not supported — the manifest setting governs */ }
+}
+
+/** Hand orientation back to whatever the manifest asks for. */
+function restoreDisplayOrientationLock() {
+    try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (e) {}
+}
+
 document.addEventListener('visibilitychange', () => {
     if (!displayModeActive || document.visibilityState !== 'visible') return;
     requestDisplayWakeLock();
@@ -6927,10 +7011,13 @@ function enterDisplayMode(opts) {
     try { history.pushState({ calgoDisplay: true }, '', location.href); displayHistoryPushed = true; } catch (e) {}
 
     // Chromeless where the API allows it; an installed PWA is already chromeless.
+    // Releasing the orientation lock is chained onto this, because Chrome on Android only
+    // honours screen.orientation.lock() while the document is fullscreen.
     try {
         const request = document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen;
-        if (request) Promise.resolve(request.call(document.documentElement)).catch(() => {});
-    } catch (e) {}
+        if (request) Promise.resolve(request.call(document.documentElement)).then(releaseDisplayOrientationLock, releaseDisplayOrientationLock);
+        else releaseDisplayOrientationLock();
+    } catch (e) { releaseDisplayOrientationLock(); }
 
     requestDisplayWakeLock();
 
@@ -6941,8 +7028,9 @@ function enterDisplayMode(opts) {
     displaySyncTimer  = setInterval(syncDisplayData, DISPLAY_SYNC_INTERVAL_MS);
     displayDriftTimer = setInterval(driftDisplayLayout, 60000);
 
-    window.addEventListener('resize', fitDisplayLayout);
-    window.addEventListener('orientationchange', fitDisplayLayout);
+    window.addEventListener('resize', scheduleDisplayRefit);
+    window.addEventListener('orientationchange', scheduleDisplayRefit);
+    try { screen.orientation && screen.orientation.addEventListener('change', scheduleDisplayRefit); } catch (e) {}
 
     syncDisplayData();
 }
@@ -6957,11 +7045,14 @@ function exitDisplayMode(opts) {
     clearInterval(displaySyncTimer);   displaySyncTimer   = null;
     clearInterval(displayDriftTimer);  displayDriftTimer  = null;
     clearTimeout(displayControlsTimer); displayControlsTimer = null;
+    clearTimeout(displayRefitTimer);    displayRefitTimer    = null;
 
-    window.removeEventListener('resize', fitDisplayLayout);
-    window.removeEventListener('orientationchange', fitDisplayLayout);
+    window.removeEventListener('resize', scheduleDisplayRefit);
+    window.removeEventListener('orientationchange', scheduleDisplayRefit);
+    try { screen.orientation && screen.orientation.removeEventListener('change', scheduleDisplayRefit); } catch (e) {}
 
     releaseDisplayWakeLock();
+    restoreDisplayOrientationLock();
 
     const root = $('displayMode');
     if (root) {

@@ -10,7 +10,10 @@
  *  - skipWaiting + clients.claim so a new SW version takes over immediately on next load.
  *  - This can never serve stale content while online, because network is always tried first.
  */
-const CACHE = 'calgo-shell-v1';
+// Bump this whenever a release must not be served from an old offline copy. The activate
+// handler deletes every cache that isn't this one, so an installed PWA that was launched
+// offline can't keep showing a previous build forever.
+const CACHE = 'calgo-shell-v2';
 
 self.addEventListener('install', event => {
     self.skipWaiting();
