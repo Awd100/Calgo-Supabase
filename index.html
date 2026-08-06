@@ -743,6 +743,36 @@
         .disp-sheet-note { font-size: 11px; line-height: 1.5; opacity: 0.5; margin-top: 6px; }
         .disp-sheet-warn { font-size: 11px; line-height: 1.5; margin-top: 8px; padding: 8px 10px; border-radius: 9px; background: rgba(245,158,11,0.16); border: 1px solid rgba(245,158,11,0.4); color: #fcd34d; }
 
+        /* ── Wallpaper editor — one photo, previewed in both screen orientations ── */
+        .disp-editor {
+            position: absolute; inset: 0; z-index: 5; display: none;
+            overflow-y: auto; padding: 20px 18px 30px;
+            background: rgba(9,13,26,0.96); color: #fff;
+            backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+        }
+        .disp-editor.open { display: block; }
+        .disp-editor h4 { font-size: 15px; font-weight: 800; margin-bottom: 6px; }
+        .disp-editor-previews { display: flex; gap: 16px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+        .disp-preview-wrap { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+        /* Fixed-height slot so the upright and sideways previews share one baseline and
+           their labels and Fill/Fit buttons line up. */
+        .disp-preview-slot { height: 208px; display: flex; align-items: center; }
+        .disp-preview {
+            border-radius: 10px; border: 1px solid rgba(255,255,255,0.3);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+        }
+        /* Phone-shaped, so the preview reads as "how it will look on the screen". */
+        .disp-preview.portrait  { width: 104px; height: 208px; }
+        .disp-preview.landscape { width: 208px; height: 104px; }
+        .disp-preview-label { font-size: 11px; font-weight: 700; opacity: 0.55; }
+        .disp-fit-row { display: flex; gap: 6px; }
+        .disp-fit-btn {
+            width: auto; margin: 0; padding: 5px 14px; border-radius: 8px; cursor: pointer;
+            font-size: 11px; font-weight: 700; font-family: inherit;
+            border: 1px solid rgba(255,255,255,0.24); background: rgba(255,255,255,0.07); color: #fff;
+        }
+        .disp-fit-btn.active { border-color: #fff; background: rgba(255,255,255,0.24); }
+
         /* ── Launcher card in the profile tab ── */
         .disp-launch-btn {
             width: 100%; padding: 13px; border-radius: 13px; cursor: pointer; margin: 0;
@@ -1078,6 +1108,9 @@
 
     <!-- Settings sheet — rendered by renderDisplaySheet() so changes preview live -->
     <div class="disp-sheet" id="dispSheet" onclick="event.stopPropagation()"></div>
+
+    <!-- Wallpaper editor — rendered by renderDisplayWallpaperEditor() -->
+    <div class="disp-editor" id="dispEditor" onclick="event.stopPropagation()"></div>
     <input type="file" id="dispWallpaperInput" accept="image/*" class="hidden" onchange="handleDisplayWallpaperUpload(this)">
 </div>
 
@@ -6364,7 +6397,10 @@ const DISPLAY_SETTINGS_KEY = 'disp';
 const DISPLAY_DEFAULTS = {
     theme:           'midnight',
     wallpaper:       null,     // data-URL, downscaled — overrides the theme background
-    wallpaperFit:    'cover',  // 'cover' = fill and crop · 'contain' = whole photo, theme behind
+    // Fit is per orientation: a wide photo usually wants to fill a sideways screen but be
+    // shown whole on an upright one. 'cover' = fill and crop · 'contain' = whole photo.
+    wallpaperFitPortrait:  'cover',
+    wallpaperFitLandscape: 'cover',
     showSeconds:     false,
     hour12:          true,
     keepAwake:       true,
@@ -6429,13 +6465,29 @@ let displaySyncTimer      = null;
 let displayDriftTimer     = null;
 let displayControlsTimer  = null;
 let displayRefitTimer     = null;
+let displayWallpaperSource = null;   // the picked image, kept only while the editor is open
+let displayWallpaperDraft  = null;   // { rotation, fitPortrait, fitLandscape, previewUrl }
 
 /* ── Settings ── */
 
 /** Read display settings (cached — the clock re-reads these once a second). */
 function loadDisplaySettings() {
-    if (!displaySettingsCache) displaySettingsCache = { ...DISPLAY_DEFAULTS, ...(Storage.getRaw(DISPLAY_SETTINGS_KEY) || {}) };
+    if (!displaySettingsCache) {
+        const saved = Storage.getRaw(DISPLAY_SETTINGS_KEY) || {};
+        // Migrate the single pre-per-orientation fit setting onto both orientations.
+        if (saved.wallpaperFit && !saved.wallpaperFitPortrait) {
+            saved.wallpaperFitPortrait = saved.wallpaperFitLandscape = saved.wallpaperFit;
+        }
+        displaySettingsCache = { ...DISPLAY_DEFAULTS, ...saved };
+    }
     return displaySettingsCache;
+}
+
+/** Which fit applies right now — the screen's current orientation decides. */
+function getDisplayWallpaperFit(settings) {
+    const isPortrait = window.innerHeight >= window.innerWidth;
+    const value = isPortrait ? settings.wallpaperFitPortrait : settings.wallpaperFitLandscape;
+    return value === 'contain' ? 'contain' : 'cover';
 }
 
 /**
@@ -6576,7 +6628,7 @@ function applyDisplayTheme() {
     // 'contain' letterboxes a photo whose shape doesn't match the screen — a landscape
     // wallpaper on an upright phone — and paints the theme behind it rather than bare black.
     if (wall) {
-        const fit = settings.wallpaperFit === 'contain' ? 'contain' : 'cover';
+        const fit = getDisplayWallpaperFit(settings);
         wall.style.background = settings.wallpaper
             ? `url("${settings.wallpaper}") center/${fit} no-repeat, ${theme.bg}`
             : theme.bg;
@@ -6744,6 +6796,7 @@ function fitDisplayLayout() {
  * box and leaves the clock the wrong size until something else nudges it.
  */
 function scheduleDisplayRefit() {
+    applyDisplayTheme();      // wallpaper fit is per orientation, so rotating can change it
     fitDisplayLayout();
     clearTimeout(displayRefitTimer);
     displayRefitTimer = setTimeout(fitDisplayLayout, 260);
@@ -6828,14 +6881,9 @@ function renderDisplaySheet() {
             <div class="disp-field-label">Wallpaper</div>
             <button class="disp-sheet-btn" onclick="$('dispWallpaperInput').click()">🖼️ ${settings.wallpaper ? 'Change photo' : 'Choose a photo'}</button>
             ${settings.wallpaper ? `
-            <div style="display:flex;gap:8px;margin-bottom:8px;">
-                <button class="disp-sheet-btn" style="margin:0;${settings.wallpaperFit !== 'contain' ? 'border-color:#fff;background:rgba(255,255,255,0.2);' : ''}"
-                    onclick="updateDisplaySetting('wallpaperFit','cover')">Fill screen</button>
-                <button class="disp-sheet-btn" style="margin:0;${settings.wallpaperFit === 'contain' ? 'border-color:#fff;background:rgba(255,255,255,0.2);' : ''}"
-                    onclick="updateDisplaySetting('wallpaperFit','contain')">Whole photo</button>
-            </div>
+            <button class="disp-sheet-btn" onclick="editCurrentDisplayWallpaper()">⟲ Adjust fit &amp; rotation</button>
             <button class="disp-sheet-btn" onclick="clearDisplayWallpaper()">✕ Remove photo</button>` : ''}
-            <div class="disp-sheet-note">Photos are shrunk before saving and stay on this device only — they are never uploaded.${settings.wallpaper ? ' “Fill screen” crops a wide photo on an upright screen; “Whole photo” shows all of it with the theme behind.' : ''}</div>
+            <div class="disp-sheet-note">Photos are shrunk before saving and stay on this device only — they are never uploaded.</div>
         </div>
 
         <div class="disp-field">
@@ -6884,9 +6932,9 @@ function updateDisplaySetting(key, value) {
 /* ── Wallpaper ── */
 
 /**
- * Downscale + JPEG-encode the chosen photo before it goes anywhere near localStorage.
- * A raw phone photo as a data-URL is several MB and would blow the quota that also
- * holds bookings and blocks.
+ * Picking a photo opens the editor rather than committing straight away — the shape of a
+ * photo rarely matches the shape of a screen, so the choice of how it sits is the whole
+ * point. The picked image is kept in memory as the encoding source for the session.
  */
 function handleDisplayWallpaperUpload(inputEl) {
     const file = inputEl.files && inputEl.files[0];
@@ -6898,29 +6946,169 @@ function handleDisplayWallpaperUpload(inputEl) {
     reader.onload  = e => {
         const image = new Image();
         image.onerror = () => showToast('⚠️ That file is not an image Calgo can read.');
-        image.onload  = () => {
-            let dataUrl = encodeDisplayWallpaper(image, DISPLAY_WALLPAPER_MAX_EDGE, 0.72);
-            if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 1200, 0.6);
-            if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 900, 0.5);
-            if (!saveDisplaySettings({ wallpaper: dataUrl })) return;
-            applyDisplayTheme();
-            renderDisplaySheet();
-            showToast('🖼️ Wallpaper set');
-        };
+        image.onload  = () => openDisplayWallpaperEditor(image);
         image.src = e.target.result;
     };
     reader.readAsDataURL(file);
 }
 
-/** Draw the image onto a canvas capped at `maxEdge` and return a JPEG data-URL. */
-function encodeDisplayWallpaper(image, maxEdge, quality) {
-    const scale  = Math.min(1, maxEdge / Math.max(image.width || 1, image.height || 1));
+/** Re-open the editor for the wallpaper already in use. The saved copy becomes the source,
+ *  so rotating within this session still re-encodes from one place, not compounding. */
+function editCurrentDisplayWallpaper() {
+    const saved = loadDisplaySettings().wallpaper;
+    if (!saved) return;
+    const image = new Image();
+    image.onerror = () => showToast('⚠️ Could not load the current wallpaper.');
+    image.onload  = () => openDisplayWallpaperEditor(image);
+    image.src = saved;
+}
+
+/**
+ * @param {HTMLImageElement} image the source to edit — never re-assigned while open
+ */
+function openDisplayWallpaperEditor(image) {
+    const settings = loadDisplaySettings();
+    displayWallpaperSource = image;
+    displayWallpaperDraft  = {
+        rotation:      0,
+        fitPortrait:   settings.wallpaperFitPortrait  === 'contain' ? 'contain' : 'cover',
+        fitLandscape:  settings.wallpaperFitLandscape === 'contain' ? 'contain' : 'cover',
+        previewUrl:    ''
+    };
+    refreshDisplayWallpaperPreview();
+    $('dispSheet')?.classList.remove('open');
+    $('dispEditor')?.classList.add('open');
+    renderDisplayWallpaperEditor();
+}
+
+function closeDisplayWallpaperEditor() {
+    $('dispEditor')?.classList.remove('open');
+    displayWallpaperSource = null;
+    displayWallpaperDraft  = null;
+    renderDisplaySheet();
+    $('dispSheet')?.classList.add('open');
+}
+
+/** Rebuild the small preview image at the draft's current rotation. */
+function refreshDisplayWallpaperPreview() {
+    if (!displayWallpaperSource || !displayWallpaperDraft) return;
+    displayWallpaperDraft.previewUrl = encodeDisplayWallpaper(displayWallpaperSource, 640, 0.72, displayWallpaperDraft.rotation);
+}
+
+function rotateDisplayWallpaper() {
+    if (!displayWallpaperDraft) return;
+    displayWallpaperDraft.rotation = (displayWallpaperDraft.rotation + 90) % 360;
+    refreshDisplayWallpaperPreview();
+    renderDisplayWallpaperEditor();
+}
+
+function setDisplayWallpaperFit(orientation, fit) {
+    if (!displayWallpaperDraft) return;
+    displayWallpaperDraft[orientation === 'portrait' ? 'fitPortrait' : 'fitLandscape'] = fit;
+    renderDisplayWallpaperEditor();
+}
+
+/** Describe the photo's own shape, after any rotation the user has applied. */
+function describeDisplayWallpaperShape() {
+    if (!displayWallpaperSource || !displayWallpaperDraft) return '';
+    const swapped = displayWallpaperDraft.rotation === 90 || displayWallpaperDraft.rotation === 270;
+    const width   = swapped ? displayWallpaperSource.naturalHeight : displayWallpaperSource.naturalWidth;
+    const height  = swapped ? displayWallpaperSource.naturalWidth  : displayWallpaperSource.naturalHeight;
+    const ratio   = width / (height || 1);
+    const shape   = ratio > 1.1 ? 'Landscape photo' : (ratio < 0.9 ? 'Portrait photo' : 'Square photo');
+    return `${shape} · ${width} × ${height}`;
+}
+
+function renderDisplayWallpaperEditor() {
+    const editor = $('dispEditor');
+    if (!editor || !displayWallpaperDraft) return;
+    const draft = displayWallpaperDraft;
+
+    // Same background construction as the live wall, so "Fit" previews the real theme
+    // showing through rather than a black box.
+    const themeBg = getDisplayTheme(loadDisplaySettings().theme).bg;
+    const previewBox = (orientation, label, fit) => `
+        <div class="disp-preview-wrap">
+            <div class="disp-preview-slot">
+                <div class="disp-preview ${orientation}" style="background:url('${draft.previewUrl}') center/${fit} no-repeat, ${themeBg};"></div>
+            </div>
+            <div class="disp-preview-label">${label}</div>
+            <div class="disp-fit-row">
+                <button class="disp-fit-btn ${fit === 'cover'   ? 'active' : ''}" onclick="setDisplayWallpaperFit('${orientation}','cover')">Fill</button>
+                <button class="disp-fit-btn ${fit === 'contain' ? 'active' : ''}" onclick="setDisplayWallpaperFit('${orientation}','contain')">Fit</button>
+            </div>
+        </div>`;
+
+    editor.innerHTML = `
+        <h4>🖼️ Wallpaper</h4>
+        <div class="disp-sheet-note" style="margin-bottom:12px;">${escapeHtml(describeDisplayWallpaperShape())}</div>
+        <div class="disp-editor-previews">
+            ${previewBox('portrait',  'Upright',  draft.fitPortrait)}
+            ${previewBox('landscape', 'Sideways', draft.fitLandscape)}
+        </div>
+        <div class="disp-sheet-note" style="text-align:center;margin:12px 0 14px;">
+            Each preview shows how the photo sits when the screen is turned that way.
+            <strong>Fill</strong> crops to cover the screen · <strong>Fit</strong> shows the whole photo with the theme behind.
+        </div>
+        <button class="disp-sheet-btn" onclick="rotateDisplayWallpaper()">⟲ Rotate 90°</button>
+        <button class="disp-sheet-btn" style="border-color:#fff;background:rgba(255,255,255,0.22);" onclick="saveDisplayWallpaper()">✓ Use this wallpaper</button>
+        <button class="disp-sheet-btn" onclick="closeDisplayWallpaperEditor()">Cancel</button>`;
+}
+
+/** Encode once, at full quality, from the untouched source. */
+function saveDisplayWallpaper() {
+    if (!displayWallpaperSource || !displayWallpaperDraft) return;
+    const draft   = displayWallpaperDraft;
+    const dataUrl = encodeWallpaperWithinBudget(displayWallpaperSource, draft.rotation);
+    const saved   = saveDisplaySettings({
+        wallpaper:             dataUrl,
+        wallpaperFitPortrait:  draft.fitPortrait,
+        wallpaperFitLandscape: draft.fitLandscape
+    });
+    if (!saved) return;                 // quota refused — settings untouched, editor stays open
+    applyDisplayTheme();
+    closeDisplayWallpaperEditor();
+    showToast('🖼️ Wallpaper set');
+}
+
+/**
+ * Draw the image onto a canvas capped at `maxEdge`, optionally turned, and return a JPEG
+ * data-URL. Rotation is baked into the pixels so rendering stays a plain background-image.
+ * Always encode from the ORIGINAL picked image — re-encoding an already-compressed result
+ * on every rotate would visibly degrade it after a few taps.
+ * @param {HTMLImageElement} image
+ * @param {number} maxEdge
+ * @param {number} quality
+ * @param {number} [rotation] 0 · 90 · 180 · 270, clockwise
+ */
+function encodeDisplayWallpaper(image, maxEdge, quality, rotation) {
+    const turn    = ((rotation || 0) % 360 + 360) % 360;
+    const swapped = turn === 90 || turn === 270;
+    const sourceW = image.naturalWidth  || image.width  || 1;
+    const sourceH = image.naturalHeight || image.height || 1;
+    const outerW  = swapped ? sourceH : sourceW;
+    const outerH  = swapped ? sourceW : sourceH;
+
+    const scale  = Math.min(1, maxEdge / Math.max(outerW, outerH));
     const canvas = document.createElement('canvas');
-    canvas.width  = Math.max(1, Math.round((image.width  || 1) * scale));
-    canvas.height = Math.max(1, Math.round((image.height || 1) * scale));
+    canvas.width  = Math.max(1, Math.round(outerW * scale));
+    canvas.height = Math.max(1, Math.round(outerH * scale));
+
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    if (turn) ctx.rotate(turn * Math.PI / 180);
+    const drawW = Math.max(1, Math.round(sourceW * scale));
+    const drawH = Math.max(1, Math.round(sourceH * scale));
+    ctx.drawImage(image, -drawW / 2, -drawH / 2, drawW, drawH);
     return canvas.toDataURL('image/jpeg', quality);
+}
+
+/** Shrink to the storage budget, stepping down size then quality. */
+function encodeWallpaperWithinBudget(image, rotation) {
+    let dataUrl = encodeDisplayWallpaper(image, DISPLAY_WALLPAPER_MAX_EDGE, 0.72, rotation);
+    if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 1200, 0.6, rotation);
+    if (dataUrl.length > DISPLAY_WALLPAPER_MAX_BYTES) dataUrl = encodeDisplayWallpaper(image, 900, 0.5, rotation);
+    return dataUrl;
 }
 
 function clearDisplayWallpaper() {
@@ -7111,7 +7299,10 @@ function exitDisplayMode(opts) {
     }
     document.body.classList.remove('disp-open');
     $('dispSheet')?.classList.remove('open');
+    $('dispEditor')?.classList.remove('open');
     $('dispControls')?.classList.remove('show');
+    displayWallpaperSource = null;   // release the full-size source image
+    displayWallpaperDraft  = null;
 
     try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen(); } catch (e) {}
 
