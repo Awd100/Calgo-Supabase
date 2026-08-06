@@ -13,7 +13,7 @@
 // Bump this whenever a release must not be served from an old offline copy. The activate
 // handler deletes every cache that isn't this one, so an installed PWA that was launched
 // offline can't keep showing a previous build forever.
-const CACHE = 'calgo-shell-v2';
+const CACHE = 'calgo-shell-v3';
 
 self.addEventListener('install', event => {
     self.skipWaiting();
@@ -28,7 +28,7 @@ self.addEventListener('push', event => {
         body: payload.body,
         tag: payload.tag,
         renotify: true,
-        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="20" fill="%236366f1"/><text x="50" y="68" text-anchor="middle" font-size="50">📅</text></svg>',
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="114" fill="%23f5f3ec"/><g fill="%231b1e2a"><rect x="176" y="112" width="26" height="60" rx="13"/><rect x="310" y="112" width="26" height="60" rx="13"/><rect x="122" y="146" width="268" height="248" rx="54"/></g><g fill="none" stroke="%23d4483b" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"><path d="M186,222L248,270L186,318"/><path d="M272,222L334,270L272,318"/></g></svg>',
         data: { url: self.registration.scope }
     }));
 });
