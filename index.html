@@ -572,6 +572,12 @@
         ══════════════════════════════════════ */
         #displayMode {
             position: fixed; inset: 0; z-index: 1500; overflow: hidden;
+            /* A fixed element sizes to the LAYOUT viewport, which on mobile Chrome is the
+               taller URL-bar-hidden height — so with the bar showing, the bottom of the
+               display sits below the visible area and rows get clipped. dvh tracks the
+               visible height instead. syncDisplayViewportHeight() covers browsers without
+               dvh, since the URL bar appearing fires no resize event. */
+            height: 100dvh;
             background: #0b1020; color: var(--disp-fg, #fff);
             font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
             transition: filter 1.2s ease;
@@ -644,7 +650,9 @@
             height: var(--disp-row-h, 44px); min-width: 0;
             padding: 0 clamp(8px, 1.6vmin, 18px);
             border-radius: clamp(8px, 1.2vmin, 16px);
-            font-size: calc(var(--disp-row-h, 44px) * 0.36);
+            /* Text size is what has to stay legible, not the row box — so a squeezed row
+               keeps 11px type instead of shrinking proportionally into nothing. */
+            font-size: max(11px, calc(var(--disp-row-h, 44px) * 0.36));
             background: var(--disp-free-bg, rgba(255,255,255,0.05));
             border: 1px solid transparent;
         }
@@ -6397,7 +6405,7 @@ const DISPLAY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
  * true: one column would push rows under the legibility floor, AND the resulting columns
  * are still wide enough to say something. That keeps an upright phone (tall, narrow) on
  * one column and rescues a landscape phone (short, wide), where 18 rows can't otherwise fit. */
-const DISPLAY_MIN_ROW_HEIGHT      = 24;
+const DISPLAY_MIN_ROW_HEIGHT      = 21;
 const DISPLAY_MIN_COLUMN_WIDTH    = 200;
 const DISPLAY_MAX_AGENDA_COLUMNS  = 3;
 
@@ -6656,10 +6664,26 @@ function renderDisplayAgenda() {
  * never scrolls: 18 rows at 6am shrink, 3 rows at 9pm grow.
  * The clock is measured at a probe size and scaled, which works on any font/zoom.
  */
+/**
+ * Pin the overlay to the height actually on screen.
+ * `position: fixed` resolves against the layout viewport, which mobile Chrome keeps at the
+ * URL-bar-hidden height — so the display runs off the bottom of the screen whenever the bar
+ * is showing. `height: 100dvh` fixes it where supported; this covers everything else, and
+ * costs nothing when dvh already got it right.
+ */
+function syncDisplayViewportHeight() {
+    const root = $('displayMode');
+    const vv   = window.visualViewport;
+    if (!root || !vv || !vv.height) return;
+    if (Math.abs(vv.height - root.clientHeight) > 1) root.style.height = Math.round(vv.height) + 'px';
+}
+
 function fitDisplayLayout() {
     const root = $('displayMode');
     if (!root || root.classList.contains('hidden')) return;
+    syncDisplayViewportHeight();
 
+    const shellEl = $('dispShell');
     const timeEl  = $('dispTime');
     const clockEl = timeEl && timeEl.parentElement;
     if (timeEl && clockEl && clockEl.clientWidth > 0 && clockEl.clientHeight > 0) {
@@ -6668,6 +6692,21 @@ function fitDisplayLayout() {
         const probeWidth = timeEl.scrollWidth || 1;   // reading this forces the reflow we need
         let size = PROBE * (clockEl.clientWidth * 0.98) / probeWidth;
         size = Math.min(size, clockEl.clientHeight * 0.46);
+
+        // Portrait stacks clock above timeline, so they compete for the same vertical space.
+        // The timeline wins: work out the room it needs at the minimum row height and let
+        // the clock have whatever is left. On a roomy day the cap never binds and the clock
+        // stays large; at 6am with 18 hours to show it shrinks rather than pushing rows off
+        // the bottom of the screen.
+        if (shellEl && displayRowCount > 0 && window.innerHeight >= window.innerWidth) {
+            const metaHeight   = Math.max(0, clockEl.clientHeight - timeEl.getBoundingClientRect().height);
+            const rowGap       = Math.max(3, Math.round(shellEl.clientHeight * 0.008));
+            const agendaNeeds  = displayRowCount * DISPLAY_MIN_ROW_HEIGHT + rowGap * (displayRowCount - 1);
+            const shellGap     = parseFloat(getComputedStyle(shellEl).rowGap) || 0;
+            const clockRoom    = shellEl.clientHeight - metaHeight - agendaNeeds - shellGap;
+            size = Math.min(size, Math.max(44, clockRoom / 0.95));   // 0.95 = .disp-time line-height
+        }
+
         size = Math.max(34, Math.min(size, 260));
         root.style.setProperty('--disp-clock-size', Math.floor(size) + 'px');
     }
@@ -6678,12 +6717,18 @@ function fitDisplayLayout() {
         const heightFor      = perColumn => Math.floor((listEl.clientHeight - gap * (perColumn - 1)) / perColumn);
         const columnWidthFor = count      => (listEl.clientWidth - gap * (count - 1)) / count;
 
+        const fitsIn = count => heightFor(Math.ceil(displayRowCount / count)) >= DISPLAY_MIN_ROW_HEIGHT;
+
         // Prefer one column; add one only while rows are still too short AND the extra
         // column would leave enough room to read a label.
         let columns = 1;
-        while (columns < DISPLAY_MAX_AGENDA_COLUMNS
-               && heightFor(Math.ceil(displayRowCount / columns)) < DISPLAY_MIN_ROW_HEIGHT
+        while (columns < DISPLAY_MAX_AGENDA_COLUMNS && !fitsIn(columns)
                && columnWidthFor(columns + 1) >= DISPLAY_MIN_COLUMN_WIDTH) columns++;
+
+        // Last resort — an upright phone just after midnight has all 24 hours to show and
+        // no layout fits them at a legible size. Split anyway: a truncated label beats
+        // hours falling off the bottom of the screen.
+        while (columns < DISPLAY_MAX_AGENDA_COLUMNS && !fitsIn(columns)) columns++;
 
         const perColumn = Math.ceil(displayRowCount / columns);
         const height    = Math.max(DISPLAY_MIN_ROW_HEIGHT, Math.min(heightFor(perColumn), 110));
@@ -7031,6 +7076,9 @@ function enterDisplayMode(opts) {
     window.addEventListener('resize', scheduleDisplayRefit);
     window.addEventListener('orientationchange', scheduleDisplayRefit);
     try { screen.orientation && screen.orientation.addEventListener('change', scheduleDisplayRefit); } catch (e) {}
+    // The only signal mobile Chrome gives when the URL bar slides in or out — window
+    // 'resize' does NOT fire for it, so without this the display stays mis-sized.
+    try { window.visualViewport && window.visualViewport.addEventListener('resize', scheduleDisplayRefit); } catch (e) {}
 
     syncDisplayData();
 }
@@ -7050,6 +7098,7 @@ function exitDisplayMode(opts) {
     window.removeEventListener('resize', scheduleDisplayRefit);
     window.removeEventListener('orientationchange', scheduleDisplayRefit);
     try { screen.orientation && screen.orientation.removeEventListener('change', scheduleDisplayRefit); } catch (e) {}
+    try { window.visualViewport && window.visualViewport.removeEventListener('resize', scheduleDisplayRefit); } catch (e) {}
 
     releaseDisplayWakeLock();
     restoreDisplayOrientationLock();
@@ -7058,6 +7107,7 @@ function exitDisplayMode(opts) {
     if (root) {
         root.classList.add('hidden');
         root.classList.remove('dimmed');
+        root.style.height = '';   // drop the pinned height so CSS governs again
     }
     document.body.classList.remove('disp-open');
     $('dispSheet')?.classList.remove('open');
