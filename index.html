@@ -2194,10 +2194,72 @@ function showTab(tabName) {
    AVATAR UPLOAD
 ══════════════════════════════════════ */
 
+/* An avatar is never drawn larger than ~110px, so 320 covers even a retina profile
+ * header. Keeping it small matters more than it looks: the avatar is copied into
+ * FRIEND ENTRIES too (see buildFriendEntryForContact / addFriend), so one oversized
+ * photo is duplicated across every list it appears in — and it all shares the same
+ * localStorage as bookings and blocks. */
+const AVATAR_MAX_EDGE  = 320;
+const AVATAR_MAX_BYTES = 120 * 1024;
+
+/**
+ * Centre-crop to a square and JPEG-encode, matching how avatars are actually displayed
+ * (a circle with object-fit:cover) so no stored pixel is one nobody ever sees.
+ * @param {HTMLImageElement} image
+ * @param {number} size   output edge in px
+ * @param {number} quality
+ */
+function encodeAvatarImage(image, size, quality) {
+    const sourceWidth  = image.naturalWidth  || image.width  || 1;
+    const sourceHeight = image.naturalHeight || image.height || 1;
+    const side = Math.min(sourceWidth, sourceHeight);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';                 // JPEG has no alpha; a transparent PNG
+    ctx.fillRect(0, 0, size, size);            // would otherwise come out black
+    ctx.drawImage(image, (sourceWidth - side) / 2, (sourceHeight - side) / 2, side, side, 0, 0, size, size);
+    return canvas.toDataURL('image/jpeg', quality);
+}
+
+/**
+ * Shrink the chosen photo before it is stored anywhere. A raw phone photo as a data-URL
+ * is several megabytes — enough to blow the localStorage quota that also holds bookings
+ * and blocks, and enough to bloat the Supabase users row it syncs into.
+ */
 function handleAvatarUpload(inputEl) {
-    const file = inputEl.files[0]; if (!file) return;
+    const file = inputEl.files && inputEl.files[0];
+    inputEl.value = '';                        // let the same file be re-picked later
+    if (!file) return;
+
     const reader = new FileReader();
-    reader.onload = e => { currentUser.avatar = e.target.result; persistUser(currentUser); renderProfile(); updateNavBar(); showToast('✅ Photo updated'); };
+    reader.onerror = () => showToast('⚠️ Could not read that image.');
+    reader.onload  = e => {
+        const image = new Image();
+        image.onerror = () => showToast('⚠️ That file is not an image Calgo can read.');
+        image.onload  = () => {
+            let dataUrl = encodeAvatarImage(image, AVATAR_MAX_EDGE, 0.82);
+            if (dataUrl.length > AVATAR_MAX_BYTES) dataUrl = encodeAvatarImage(image, 240, 0.7);
+            if (dataUrl.length > AVATAR_MAX_BYTES) dataUrl = encodeAvatarImage(image, 180, 0.6);
+
+            // persistUser writes localStorage BEFORE the cloud, so a quota failure here
+            // means nothing was uploaded either — revert and leave the old photo in place.
+            const previousAvatar = currentUser.avatar;
+            currentUser.avatar = dataUrl;
+            try {
+                persistUser(currentUser);
+            } catch (err) {
+                currentUser.avatar = previousAvatar;
+                showToast('⚠️ Not enough space on this device to save that photo.');
+                return;
+            }
+            renderProfile();
+            updateNavBar();
+            showToast('✅ Photo updated');
+        };
+        image.src = e.target.result;
+    };
     reader.readAsDataURL(file);
 }
 
