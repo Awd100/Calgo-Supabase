@@ -88,14 +88,19 @@
             text-align: center;
             animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
         }
+        /* ── Brand mark ──
+           The logo carries its own ground and rounded corners, so these containers keep
+           only their size, shadow and animation — no background of their own, or the mark
+           would sit as a box inside a box. */
+        .brand-mark { width: 26px; height: 26px; border-radius: 7px; flex: 0 0 auto; display: block; }
+        .logo-icon > svg, .loading-logo > svg { width: 100%; height: 100%; display: block; border-radius: inherit; }
+
         .logo-icon {
             width: 68px; height: 68px;
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
             border-radius: 20px;
             display: flex; align-items: center; justify-content: center;
             margin: 0 auto 22px;
-            font-size: 34px;
-            box-shadow: 0 10px 30px rgba(99,102,241,0.3);
+            box-shadow: 0 10px 30px rgba(15,23,42,0.22);
         }
         .login-card h1     { font-size: 26px; margin-bottom: 6px; }
         .login-card .subtitle { color: var(--text-light); margin-bottom: 28px; font-size: 14px; }
@@ -517,10 +522,9 @@
         }
         .loading-overlay.fade-out { opacity: 0; pointer-events: none; }
         .loading-logo {
-            width: 80px; height: 80px;
-            background: rgba(255,255,255,0.2); border-radius: 24px;
+            width: 80px; height: 80px; border-radius: 24px;
             display: flex; align-items: center; justify-content: center;
-            font-size: 42px; box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
             animation: loadingPulse 1.6s ease-in-out infinite;
         }
         .loading-title    { color: white; font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
@@ -787,10 +791,32 @@
 <body>
 
 <!-- ══════════════════════════════════════
+     BRAND MARK
+     Defined once and referenced with <use> by the static logo spots. The two places
+     that rebuild their own DOM (the print/export header and the invitation page)
+     inline CALGO_MARK_SVG instead, because one replaces document.body outright and
+     the other is rendered by html2canvas — neither can rely on this symbol surviving.
+══════════════════════════════════════ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="calgoMark" viewBox="0 0 512 512">
+        <rect width="512" height="512" rx="114" fill="#f5f3ec"/>
+        <g fill="#1b1e2a">
+            <rect x="176" y="112" width="26" height="60" rx="13"/>
+            <rect x="310" y="112" width="26" height="60" rx="13"/>
+            <rect x="122" y="146" width="268" height="248" rx="54"/>
+        </g>
+        <g fill="none" stroke="#d4483b" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M186 222 L248 270 L186 318"/>
+            <path d="M272 222 L334 270 L272 318"/>
+        </g>
+    </symbol>
+</svg>
+
+<!-- ══════════════════════════════════════
      LOADING OVERLAY
 ══════════════════════════════════════ -->
 <div id="loadingOverlay" class="loading-overlay">
-    <div class="loading-logo">📅</div>
+    <div class="loading-logo"><svg viewBox="0 0 512 512" role="img" aria-label="Calgo"><use href="#calgoMark"/></svg></div>
     <div class="loading-title">Calgo</div>
     <div class="loading-subtitle" id="loadingMessage">Loading…</div>
     <div class="loading-spinner"></div>
@@ -801,7 +827,7 @@
 ══════════════════════════════════════ -->
 <div id="loginScreen" class="login-screen hidden">
     <div class="login-card">
-        <div class="logo-icon">📅</div>
+        <div class="logo-icon"><svg viewBox="0 0 512 512" role="img" aria-label="Calgo"><use href="#calgoMark"/></svg></div>
         <h1>Calgo</h1>
         <p class="subtitle">Let's Go!</p>
         <button class="oauth-btn" onclick="signInWithGoogle()">
@@ -846,7 +872,7 @@
 
     <!-- Top Bar -->
     <div class="top-bar">
-        <h2>📅 Calgo</h2>
+        <h2><svg class="brand-mark" viewBox="0 0 512 512" role="img" aria-label="Calgo"><use href="#calgoMark"/></svg>Calgo</h2>
         <div class="user-chip" onclick="toggleProfileMenu(event)">
             <div class="avatar" id="navAvatar"></div>
             <span id="navUserName" style="font-weight:600;font-size:13px;"></span>
@@ -2140,6 +2166,19 @@ async function logout() {
    hardcoded colors and images — via the Dark Reader engine. The choice
    persists locally and defaults to the OS color scheme on first run.
 ══════════════════════════════════════ */
+
+/** The brand mark as standalone markup, for the two places that cannot use the
+ *  #calgoMark symbol: the print/export header (rendered by html2canvas, which does not
+ *  reliably follow <use>) and the invitation page (which replaces document.body). */
+const CALGO_MARK_SVG =
+    '<svg viewBox="0 0 512 512" width="100%" height="100%" style="display:block" role="img" aria-label="Calgo">' +
+    '<rect width="512" height="512" rx="114" fill="#f5f3ec"/>' +
+    '<g fill="#1b1e2a">' +
+    '<rect x="176" y="112" width="26" height="60" rx="13"/>' +
+    '<rect x="310" y="112" width="26" height="60" rx="13"/>' +
+    '<rect x="122" y="146" width="268" height="248" rx="54"/></g>' +
+    '<g fill="none" stroke="#d4483b" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M186 222 L248 270 L186 318"/><path d="M272 222 L334 270 L272 318"/></g></svg>';
 
 const NIGHT_MODE_KEY   = 'night_mode';
 const NIGHT_MODE_THEME = { brightness: 100, contrast: 90, sepia: 0 };
@@ -3808,7 +3847,8 @@ function buildCleanCalendarElementForExport() {
     header.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;padding-bottom:14px;border-bottom:2px solid #e2e8f0;';
     header.innerHTML = `
         <div>
-            <div style="font-size:22px;font-weight:800;color:#6366f1;letter-spacing:-0.5px;">📅 Calgo</div>
+            <div style="font-size:22px;font-weight:800;color:#1b1e2a;letter-spacing:-0.5px;display:flex;align-items:center;gap:8px;">
+                <span style="width:26px;height:26px;display:inline-block;">${CALGO_MARK_SVG}</span>Calgo</div>
             <div style="font-size:13px;color:#64748b;margin-top:2px;">${ownerName}</div>
         </div>
         <div style="text-align:right;">
@@ -5263,7 +5303,7 @@ function handleEventUrl(params) {
     document.body.innerHTML = `
     <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#667eea 0%,#764ba2 50%,#f093fb 100%);padding:20px;font-family:sans-serif;">
         <div style="background:white;padding:40px 30px;border-radius:24px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.2);max-width:400px;width:100%;">
-            <div style="font-size:50px;margin-bottom:15px;">📅</div>
+            <div style="width:64px;height:64px;margin:0 auto 15px;">${CALGO_MARK_SVG}</div>
             <h2 style="margin:0 0 15px;font-size:20px;color:#1e293b;line-height:1.4;">You received an invitation from <strong>${inviter}</strong> on ${date} at ${displayTime}.<br><br>Shall I add this to your Calendar?</h2>
             <div style="display:flex;gap:10px;margin-top:25px;">
                 <button onclick="document.getElementById('calOpts').style.display='block';this.style.display='none';document.getElementById('noBtn').style.display='none'" style="flex:1;background:#22c55e;color:white;border:none;padding:14px;border-radius:12px;font-weight:bold;font-size:16px;cursor:pointer;">Yes</button>
